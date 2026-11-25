@@ -110,6 +110,8 @@ const settingUpdaters: {
     commands.changeShortcutActivationSetting(value as ShortcutActivation),
   hold_threshold_ms: (value) =>
     commands.changeHoldThresholdMsSetting(value as number),
+  modifier_alone_trigger: (value) =>
+    commands.changeModifierAloneTriggerSetting(value as boolean),
   selected_microphone: (value) =>
     commands.setSelectedMicrophone(
       (value as string) === "Default" || value === null

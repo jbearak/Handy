@@ -11,6 +11,7 @@
 
 mod handler;
 pub mod handy_keys;
+mod modifier_trigger;
 pub mod tauri_impl;
 
 use log::{debug, error, info, warn};
@@ -599,11 +600,21 @@ pub fn change_shortcut_activation_setting(
 
 #[tauri::command]
 #[specta::specta]
+pub fn change_modifier_alone_trigger_setting(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.modifier_alone_trigger = enabled;
+    settings::write_settings(&app, settings);
+    handy_keys::refresh_modifier_trigger(&app)
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn change_hold_threshold_ms_setting(app: AppHandle, ms: u64) -> Result<(), String> {
     let mut settings = settings::get_settings(&app);
     settings.hold_threshold_ms = ms;
     settings::write_settings(&app, settings);
-    Ok(())
+    // The modifier-alone trigger times extra modifiers with it.
+    handy_keys::refresh_modifier_trigger(&app)
 }
 
 #[tauri::command]

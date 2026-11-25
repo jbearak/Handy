@@ -389,6 +389,10 @@
           "push_to_talk": "Registra finché tieni premuta la scorciatoia",
           "toggle": "Tocca la scorciatoia per avviare la registrazione, tocca di nuovo per fermarla"
         }
+      },
+      "modifierAlone": {
+        "label": "Usa solo {{modifiers}}",
+        "description": "Premi solo {{modifiers}} per dettare, come con la tua scorciatoia. Digitare o fare clic mentre lo tieni premuto annulla la registrazione."
       }
     },
     "models": {

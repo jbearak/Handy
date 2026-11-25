@@ -39,8 +39,13 @@ use std::thread::{self, JoinHandle};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::settings::{self, get_settings, ShortcutBinding};
+use crate::TranscriptionCoordinator;
 
 use super::handler::handle_shortcut_event;
+use super::modifier_trigger::{ModifierTrigger, TriggerAction};
+
+/// The binding whose modifiers can trigger on their own.
+const TRANSCRIBE: &str = "transcribe";
 
 /// Commands that can be sent to the hotkey manager thread
 enum ManagerCommand {
@@ -53,7 +58,95 @@ enum ManagerCommand {
         binding_id: String,
         response: Sender<Result<(), String>>,
     },
+    /// Re-read the "modifier alone" setting.
+    RefreshModifierTrigger,
     Shutdown,
+}
+
+/// The "modifier alone" trigger while it is on: a listener that sees every
+/// key (it blocks nothing) and the state machine reading it.
+struct ModifierTriggerRuntime {
+    listener: KeyboardListener,
+    machine: ModifierTrigger,
+    /// The transcribe binding, e.g. "option+space".
+    hotkey_string: String,
+}
+
+impl ModifierTriggerRuntime {
+    /// The trigger for the transcribe binding `hotkey_string`, if the setting
+    /// is on and the binding has modifiers and a key.
+    fn build(app: &AppHandle, hotkey_string: &str) -> Option<Self> {
+        // Elsewhere a bare modifier can't pass through harmlessly: on Windows a
+        // lone Alt tap opens the menu bar of the app in front.
+        if !cfg!(target_os = "macos") {
+            return None;
+        }
+        let settings = get_settings(app);
+        if !settings.modifier_alone_trigger {
+            return None;
+        }
+        let chord: Hotkey = hotkey_string.parse().ok()?;
+        let machine = ModifierTrigger::new(
+            chord,
+            std::time::Duration::from_millis(settings.hold_threshold_ms),
+        )?;
+        let listener = match KeyboardListener::new() {
+            Ok(listener) => listener,
+            Err(e) => {
+                error!("Failed to start the modifier-alone listener: {e}");
+                return None;
+            }
+        };
+        info!("Modifier-alone trigger on for '{hotkey_string}'");
+        Some(Self {
+            listener,
+            machine,
+            hotkey_string: hotkey_string.to_string(),
+        })
+    }
+
+    /// Feed the listener's queued events to the machine.
+    fn drain(&mut self, app: &AppHandle) {
+        while let Some(event) = self.listener.try_recv() {
+            // Secure Input hides the keys that would discard a press.
+            let can_start = event.key.is_some() || !crate::secure_input::is_enabled_now();
+            if let Some(action) =
+                self.machine
+                    .on_key_event(&event, std::time::Instant::now(), can_start)
+            {
+                apply_trigger_action(app, &self.hotkey_string, action);
+            }
+        }
+    }
+}
+
+fn apply_trigger_action(app: &AppHandle, hotkey_string: &str, action: TriggerAction) {
+    debug!("modifier-alone trigger: {action:?}");
+    if let TriggerAction::Chord { pressed } = action {
+        handle_shortcut_event(app, TRANSCRIBE, hotkey_string, pressed);
+        return;
+    }
+    let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() else {
+        return;
+    };
+    match action {
+        TriggerAction::Press { at } | TriggerAction::Release { at } => {
+            let settings = get_settings(app);
+            coordinator.send_input_at(
+                TRANSCRIBE,
+                hotkey_string,
+                matches!(action, TriggerAction::Press { .. }),
+                settings.shortcut_activation,
+                std::time::Duration::from_millis(settings.hold_threshold_ms),
+                at,
+            );
+        }
+        TriggerAction::Discard { pressed_at } => coordinator.discard_press(TRANSCRIBE, pressed_at),
+        TriggerAction::Rebase { pressed_at, at } => {
+            coordinator.rebase_press(TRANSCRIBE, pressed_at, at)
+        }
+        TriggerAction::Chord { .. } => {}
+    }
 }
 
 /// State for the handy-keys shortcut manager
@@ -118,8 +211,15 @@ impl HandyKeysState {
         // Maps binding IDs to HotkeyIds and hotkey strings
         let mut binding_to_hotkey: HashMap<String, HotkeyId> = HashMap::new();
         let mut hotkey_to_binding: HashMap<HotkeyId, (String, String)> = HashMap::new(); // (binding_id, hotkey_string)
+        let mut modifier_trigger: Option<ModifierTriggerRuntime> = None;
 
         loop {
+            // Raw events first: a modifier went down before the chord it is
+            // part of, so the trigger must see it before the chord's event.
+            if let Some(trigger) = modifier_trigger.as_mut() {
+                trigger.drain(&app);
+            }
+
             // Check for hotkey events (non-blocking)
             while let Some(event) = manager.try_recv() {
                 if let Some((binding_id, hotkey_string)) = hotkey_to_binding.get(&event.id) {
@@ -128,6 +228,18 @@ impl HandyKeysState {
                         binding_id, hotkey_string, event.state
                     );
                     let is_pressed = event.state == HotkeyState::Pressed;
+                    if let Some(trigger) = modifier_trigger
+                        .as_mut()
+                        .filter(|_| binding_id == TRANSCRIBE)
+                    {
+                        if let Some(action) = trigger
+                            .machine
+                            .on_chord(is_pressed, std::time::Instant::now())
+                        {
+                            apply_trigger_action(&app, hotkey_string, action);
+                        }
+                        continue;
+                    }
                     handle_shortcut_event(&app, binding_id, hotkey_string, is_pressed);
                 }
             }
@@ -147,6 +259,9 @@ impl HandyKeysState {
                             &binding_id,
                             &hotkey_string,
                         );
+                        if result.is_ok() && binding_id == TRANSCRIBE {
+                            modifier_trigger = ModifierTriggerRuntime::build(&app, &hotkey_string);
+                        }
                         let _ = response.send(result);
                     }
                     ManagerCommand::Unregister {
@@ -159,7 +274,20 @@ impl HandyKeysState {
                             &mut hotkey_to_binding,
                             &binding_id,
                         );
+                        if binding_id == TRANSCRIBE {
+                            // Also while capturing a new shortcut: pressing
+                            // Option then must not start dictation.
+                            modifier_trigger = None;
+                        }
                         let _ = response.send(result);
+                    }
+                    ManagerCommand::RefreshModifierTrigger => {
+                        let transcribe = hotkey_to_binding
+                            .values()
+                            .find(|(id, _)| id == TRANSCRIBE)
+                            .map(|(_, hotkey)| hotkey.clone());
+                        modifier_trigger = transcribe
+                            .and_then(|hotkey| ModifierTriggerRuntime::build(&app, &hotkey));
                     }
                     ManagerCommand::Shutdown => {
                         info!("handy-keys manager thread shutting down");
@@ -253,6 +381,15 @@ impl HandyKeysState {
 
         rx.recv()
             .map_err(|_| "Failed to receive unregister response")?
+    }
+
+    /// Apply a change to the "modifier alone" setting.
+    pub fn refresh_modifier_trigger(&self) -> Result<(), String> {
+        self.command_sender
+            .lock()
+            .map_err(|_| "Failed to lock command_sender")?
+            .send(ManagerCommand::RefreshModifierTrigger)
+            .map_err(|_| "Failed to send refresh command".to_string())
     }
 
     /// Start recording mode for a specific binding
@@ -467,6 +604,14 @@ pub fn unregister_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<
         .try_state::<HandyKeysState>()
         .ok_or("HandyKeysState not initialized")?;
     state.unregister(&binding)
+}
+
+/// Apply a change to the "modifier alone" setting, if handy-keys is running.
+pub fn refresh_modifier_trigger(app: &AppHandle) -> Result<(), String> {
+    match app.try_state::<HandyKeysState>() {
+        Some(state) => state.refresh_modifier_trigger(),
+        None => Ok(()),
+    }
 }
 
 /// Start key recording mode

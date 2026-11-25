@@ -207,8 +207,23 @@ enum Effect {
 /// Commands processed sequentially by the coordinator thread.
 enum Command {
     Input(InputEvent),
-    Cancel { recording_was_active: bool },
+    Cancel {
+        recording_was_active: bool,
+    },
     ProcessingFinished,
+    /// Drop the session the press at `pressed_at` started (see
+    /// [`CoordinatorState::on_discard`]).
+    Discard {
+        binding_id: String,
+        pressed_at: Instant,
+    },
+    /// Time the press at `pressed_at` from `at` instead (see
+    /// [`CoordinatorState::on_rebase`]).
+    Rebase {
+        binding_id: String,
+        pressed_at: Instant,
+        at: Instant,
+    },
 }
 
 /// Decide whether a key-up should be deferred (so auto-repeat can cancel it)
@@ -514,6 +529,72 @@ impl CoordinatorState {
         }
     }
 
+    /// The press at `pressed_at` turned out to be typing (a bare modifier
+    /// followed by a letter). Forget it if it is still waiting for the
+    /// pipeline, or end the recording it started. Returns whether a live
+    /// recording must be abandoned. A press that stopped a session started
+    /// nothing, so a transcription already running is never touched.
+    fn on_discard(&mut self, binding_id: &str, pressed_at: Instant) -> bool {
+        if self
+            .pending_press
+            .as_ref()
+            .is_some_and(|p| p.binding_id == binding_id && p.pressed_at == pressed_at)
+        {
+            debug!("Discarding remembered press for '{binding_id}'");
+            self.pending_press = None;
+            self.drop_pending_release(binding_id);
+            return false;
+        }
+        let started_it = matches!(&self.stage, Stage::Recording(id) if id == binding_id)
+            && self
+                .hold
+                .as_ref()
+                .is_some_and(|h| h.pressed_at == pressed_at);
+        if !started_it {
+            return false;
+        }
+        debug!("Discarding recording for '{binding_id}': its press was typing");
+        // Settled here, not by the Cancel the abandon would send back, so a
+        // press queued meanwhile can't have its new session reset.
+        self.stage = Stage::Idle;
+        self.hold = None;
+        self.drop_pending_release(binding_id);
+        true
+    }
+
+    /// Another press of the same binding took over the press at `pressed_at`
+    /// before its key came up (Option, then Space for `option+space`): time
+    /// tap vs hold from `at`, as if the session had started there.
+    fn on_rebase(&mut self, binding_id: &str, pressed_at: Instant, at: Instant) {
+        if let Some(pending) = self
+            .pending_press
+            .as_mut()
+            .filter(|p| p.binding_id == binding_id && p.pressed_at == pressed_at && !p.locked)
+        {
+            pending.pressed_at = at;
+            return;
+        }
+        if matches!(&self.stage, Stage::Recording(id) if id == binding_id) {
+            if let Some(hold) = self
+                .hold
+                .as_mut()
+                .filter(|h| h.pressed_at == pressed_at && !h.locked)
+            {
+                hold.pressed_at = at;
+            }
+        }
+    }
+
+    fn drop_pending_release(&mut self, binding_id: &str) {
+        if self
+            .pending_release
+            .as_ref()
+            .is_some_and(|p| p.binding_id == binding_id)
+        {
+            self.pending_release = None;
+        }
+    }
+
     fn on_processing_finished(&mut self) -> Option<Effect> {
         self.stage = Stage::Idle;
         self.hold = None;
@@ -639,6 +720,20 @@ impl TranscriptionCoordinator {
                                 run_effect(&app, &mut state, effect);
                             }
                         }
+                        Command::Discard {
+                            binding_id,
+                            pressed_at,
+                        } => {
+                            if state.on_discard(&binding_id, pressed_at) {
+                                crate::utils::abandon_current_operation(&app);
+                                emit_recording_phase(&app, RecordingPhase::Cancelled);
+                            }
+                        }
+                        Command::Rebase {
+                            binding_id,
+                            pressed_at,
+                            at,
+                        } => state.on_rebase(&binding_id, pressed_at, at),
                     }
                     if !was_locked && state.is_recording_locked() {
                         emit_recording_phase(&app, RecordingPhase::Locked);
@@ -664,51 +759,72 @@ impl TranscriptionCoordinator {
         mode: ShortcutActivation,
         hold_threshold: Duration,
     ) {
-        self.send(
+        self.send_input_at(
             binding_id,
             hotkey_string,
             is_pressed,
             mode,
             hold_threshold,
-            false,
+            Instant::now(),
         );
     }
 
-    /// Send an external trigger (SIGUSR2, CLI flag). Always a toggle press,
-    /// always exempt from debounce — see [`InputEvent::external`].
-    pub fn send_external_input(&self, binding_id: &str, source: &str) {
-        self.send(
-            binding_id,
-            source,
-            true,
-            ShortcutActivation::Toggle,
-            Duration::ZERO,
-            true,
-        );
-    }
-
-    fn send(
+    /// [`Self::send_input`] for an edge observed at `at`. A later
+    /// [`Self::discard_press`] or [`Self::rebase_press`] names the press by it.
+    pub fn send_input_at(
         &self,
         binding_id: &str,
         hotkey_string: &str,
         is_pressed: bool,
         mode: ShortcutActivation,
         hold_threshold: Duration,
-        external: bool,
+        at: Instant,
     ) {
-        if self
-            .tx
-            .send(Command::Input(InputEvent {
-                binding_id: binding_id.to_string(),
-                hotkey_string: hotkey_string.to_string(),
-                is_pressed,
-                mode,
-                hold_threshold,
-                external,
-                received_at: Instant::now(),
-            }))
-            .is_err()
-        {
+        self.send_command(Command::Input(InputEvent {
+            binding_id: binding_id.to_string(),
+            hotkey_string: hotkey_string.to_string(),
+            is_pressed,
+            mode,
+            hold_threshold,
+            external: false,
+            received_at: at,
+        }));
+    }
+
+    /// Send an external trigger (SIGUSR2, CLI flag). Always a toggle press,
+    /// always exempt from debounce — see [`InputEvent::external`].
+    pub fn send_external_input(&self, binding_id: &str, source: &str) {
+        self.send_command(Command::Input(InputEvent {
+            binding_id: binding_id.to_string(),
+            hotkey_string: source.to_string(),
+            is_pressed: true,
+            mode: ShortcutActivation::Toggle,
+            hold_threshold: Duration::ZERO,
+            external: true,
+            received_at: Instant::now(),
+        }));
+    }
+
+    /// The press sent at `pressed_at` was typing, not dictation: drop the
+    /// recording it started, if it started one.
+    pub fn discard_press(&self, binding_id: &str, pressed_at: Instant) {
+        self.send_command(Command::Discard {
+            binding_id: binding_id.to_string(),
+            pressed_at,
+        });
+    }
+
+    /// Measure the hold of the press sent at `pressed_at` from `at`.
+    pub fn rebase_press(&self, binding_id: &str, pressed_at: Instant, at: Instant) {
+        self.send_command(Command::Rebase {
+            binding_id: binding_id.to_string(),
+            pressed_at,
+            at,
+        });
+    }
+
+    fn send_command(&self, command: Command) {
+        if self.tx.send(command).is_err() {
             warn!("Transcription coordinator channel closed");
         }
     }
@@ -1733,5 +1849,146 @@ mod tests {
             "held 400ms since the real key-down: must stop, not lock"
         );
         assert_eq!(state.stage, Stage::Processing);
+    }
+
+    // ---------------------------------------------------------------------
+    // Modifier-alone trigger: a bare Option press that turns out to be typing
+    // is discarded; one the chord takes over is re-timed.
+    // ---------------------------------------------------------------------
+
+    fn press_at(mode: ShortcutActivation, is_pressed: bool, at: Instant) -> InputEvent {
+        let mut event = input(mode, is_pressed);
+        event.received_at = at;
+        event
+    }
+
+    #[test]
+    fn discard_ends_the_recording_its_press_started() {
+        let mode = ShortcutActivation::HoldOrToggle;
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        assert!(matches!(
+            state.on_input(press_at(mode, true, t0), t0),
+            Some(Effect::Start { .. })
+        ));
+        assert!(state.on_discard(BINDING, t0));
+        assert_eq!(state.stage, Stage::Idle);
+        assert!(state.hold.is_none());
+        // The Cancel that abandoning sends back finds nothing left to undo.
+        state.on_cancel(true);
+        assert_eq!(state.stage, Stage::Idle);
+    }
+
+    #[test]
+    fn discard_in_toggle_mode_ends_the_locked_recording_too() {
+        let mode = ShortcutActivation::Toggle;
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        state.on_input(press_at(mode, true, t0), t0);
+        assert!(state.on_discard(BINDING, t0));
+        assert_eq!(state.stage, Stage::Idle);
+    }
+
+    #[test]
+    fn discard_after_a_stopping_press_spares_the_transcription() {
+        // A tap locked recording on; Option-down stopped it, then the user
+        // typed Option+E. The transcription in flight must survive.
+        let mode = ShortcutActivation::HoldOrToggle;
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        state.on_input(press_at(mode, true, t0), t0);
+        state.on_input(press_at(mode, false, t0 + ms(100)), t0 + ms(100));
+        assert!(state.on_grace_expired().is_none());
+        let stop_at = t0 + ms(3000);
+        assert!(matches!(
+            state.on_input(press_at(mode, true, stop_at), stop_at),
+            Some(Effect::Stop { .. })
+        ));
+        assert!(!state.on_discard(BINDING, stop_at));
+        assert_eq!(state.stage, Stage::Processing);
+    }
+
+    #[test]
+    fn discard_of_an_older_press_leaves_a_newer_session() {
+        let mode = ShortcutActivation::HoldOrToggle;
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        let newer = t0 + ms(500);
+        state.on_input(press_at(mode, true, newer), newer);
+        assert!(!state.on_discard(BINDING, t0));
+        assert_eq!(state.stage, Stage::Recording(BINDING.to_string()));
+    }
+
+    #[test]
+    fn discard_forgets_a_press_remembered_while_busy() {
+        let mode = ShortcutActivation::HoldOrToggle;
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        drive_into_processing(&mut state, t0);
+        let pressed = t0 + ms(500);
+        state.on_input(press_at(mode, true, pressed), pressed);
+        assert!(state.pending_press.is_some());
+        assert!(!state.on_discard(BINDING, pressed));
+        assert!(state.pending_press.is_none());
+        assert!(state.on_processing_finished().is_none());
+        assert_eq!(state.stage, Stage::Idle);
+    }
+
+    #[test]
+    fn discard_drops_a_deferred_release() {
+        // Option up, then a key inside the release grace (rolling typing):
+        // the deferred release must not resolve against a later session.
+        let mode = ShortcutActivation::HoldOrToggle;
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        state.on_input(press_at(mode, true, t0), t0);
+        state.on_input(press_at(mode, false, t0 + ms(80)), t0 + ms(80));
+        assert!(state.pending_release.is_some());
+        assert!(state.on_discard(BINDING, t0));
+        assert!(state.pending_release.is_none());
+    }
+
+    #[test]
+    fn rebase_times_the_hold_from_the_chord() {
+        // Option rests 400ms before Space is tapped: still a tap, measured
+        // from Space, so recording locks on as it did before the trigger.
+        let mode = ShortcutActivation::HoldOrToggle;
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        state.on_input(press_at(mode, true, t0), t0);
+        state.on_rebase(BINDING, t0, t0 + ms(400));
+        state.on_input(press_at(mode, false, t0 + ms(500)), t0 + ms(500));
+        assert!(state.on_grace_expired().is_none());
+        assert!(state.is_recording_locked());
+    }
+
+    #[test]
+    fn rebase_never_touches_another_press_or_a_locked_session() {
+        let mode = ShortcutActivation::HoldOrToggle;
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        state.on_input(press_at(mode, true, t0), t0);
+        state.on_rebase(BINDING, t0 - ms(1), t0 + ms(400));
+        assert_eq!(state.hold.as_ref().unwrap().pressed_at, t0);
+
+        let mut state = CoordinatorState::new();
+        state.on_input(press_at(ShortcutActivation::Toggle, true, t0), t0);
+        state.on_rebase(BINDING, t0, t0 + ms(400));
+        assert_eq!(state.hold.as_ref().unwrap().pressed_at, t0);
+    }
+
+    #[test]
+    fn rebase_retimes_a_press_remembered_while_busy() {
+        let mode = ShortcutActivation::HoldOrToggle;
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        drive_into_processing(&mut state, t0);
+        let pressed = t0 + ms(500);
+        state.on_input(press_at(mode, true, pressed), pressed);
+        state.on_rebase(BINDING, pressed, pressed + ms(400));
+        assert_eq!(
+            state.pending_press.as_ref().unwrap().pressed_at,
+            pressed + ms(400)
+        );
     }
 }

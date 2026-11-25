@@ -419,6 +419,10 @@ pub struct AppSettings {
     /// anything shorter is a tap that locks recording on.
     #[serde(default = "default_hold_threshold_ms")]
     pub hold_threshold_ms: u64,
+    /// The transcribe shortcut's modifiers pressed alone (Option for
+    /// `option+space`) also start dictation. handy-keys on macOS only.
+    #[serde(default)]
+    pub modifier_alone_trigger: bool,
     #[serde(default)]
     pub audio_feedback: bool,
     #[serde(default = "default_audio_feedback_volume")]
@@ -1017,6 +1021,7 @@ pub fn get_default_settings() -> AppSettings {
         bindings,
         shortcut_activation: ShortcutActivation::default(),
         hold_threshold_ms: default_hold_threshold_ms(),
+        modifier_alone_trigger: false,
         audio_feedback: false,
         audio_feedback_volume: default_audio_feedback_volume(),
         sound_theme: default_sound_theme(),
@@ -1557,6 +1562,8 @@ mod tests {
             ShortcutActivation::HoldOrToggle
         );
         assert_eq!(settings.hold_threshold_ms, default_hold_threshold_ms());
+        // Opt-in: stores from before the setting keep only their shortcut.
+        assert!(!settings.modifier_alone_trigger);
         assert!(!settings.audio_feedback);
         assert!(settings.filler_word_removal_enabled);
         // Bindings default to empty; the load path merges the real defaults in.

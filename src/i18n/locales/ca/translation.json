@@ -389,6 +389,10 @@
           "push_to_talk": "Enregistreu mentre manteniu premuda la drecera",
           "toggle": "Premeu la drecera per iniciar l'enregistrament i torneu-la a prémer per aturar-lo"
         }
+      },
+      "modifierAlone": {
+        "label": "Fes servir només {{modifiers}}",
+        "description": "Prem només {{modifiers}} per dictar, igual que la drecera. Escriure o fer clic mentre el mantens premut cancel·la l'enregistrament."
       }
     },
     "models": {

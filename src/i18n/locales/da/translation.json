@@ -389,6 +389,10 @@
           "push_to_talk": "Optager, mens du holder genvejen nede",
           "toggle": "Tryk på genvejen for at starte optagelsen, tryk igen for at stoppe"
         }
+      },
+      "modifierAlone": {
+        "label": "Brug kun {{modifiers}}",
+        "description": "Tryk på {{modifiers}} alene for at diktere, ligesom med din genvej. Skriver eller klikker du, mens du holder den nede, annulleres optagelsen."
       }
     },
     "models": {

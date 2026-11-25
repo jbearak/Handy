@@ -389,6 +389,10 @@
           "push_to_talk": "Spelar in så länge du håller genvägen nedtryckt",
           "toggle": "Tryck på genvägen för att starta inspelningen, tryck igen för att stoppa"
         }
+      },
+      "modifierAlone": {
+        "label": "Använd bara {{modifiers}}",
+        "description": "Tryck på {{modifiers}} ensam för att diktera, precis som med ditt kortkommando. Skriver eller klickar du medan du håller ned den avbryts inspelningen."
       }
     },
     "models": {

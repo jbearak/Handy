@@ -219,6 +219,18 @@ unsafe fn process_integrity_level(
 /// Centralized cancellation function that can be called from anywhere in the app.
 /// Handles cancelling both recording and transcription operations and updates UI state.
 pub fn cancel_current_operation(app: &AppHandle) {
+    let recording_was_active = abandon_current_operation(app);
+
+    // Notify coordinator so it can keep lifecycle state coherent.
+    if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
+        coordinator.notify_cancel(recording_was_active);
+    }
+}
+
+/// The work of [`cancel_current_operation`] without telling the coordinator,
+/// for the coordinator itself when it has already settled its own state.
+/// Returns whether a recording was running.
+pub fn abandon_current_operation(app: &AppHandle) -> bool {
     info!("Initiating operation cancellation...");
 
     // Unregister the cancel shortcut asynchronously
@@ -244,12 +256,8 @@ pub fn cancel_current_operation(app: &AppHandle) {
     // doesn't wait for the cancelled work, so it never blocks this thread.
     tm.maybe_unload_immediately("cancellation");
 
-    // Notify coordinator so it can keep lifecycle state coherent.
-    if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
-        coordinator.notify_cancel(recording_was_active);
-    }
-
     info!("Operation cancellation completed - returned to idle state");
+    recording_was_active
 }
 
 /// Check if using the Wayland display server protocol
