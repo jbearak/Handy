@@ -27,7 +27,7 @@
 //! polled from a dedicated recording thread. Events are emitted to the frontend
 //! via Tauri's event system.
 
-use handy_keys::{Hotkey, HotkeyId, HotkeyManager, HotkeyState, KeyboardListener};
+use handy_keys::{Hotkey, HotkeyId, HotkeyManager, HotkeyState, KeyEvent, KeyboardListener};
 use log::{debug, error, info};
 use serde::Serialize;
 use specta::Type;
@@ -66,7 +66,7 @@ enum ManagerCommand {
 /// The "modifier alone" trigger while it is on: a listener that sees every
 /// key (it blocks nothing) and the state machine reading it.
 struct ModifierTriggerRuntime {
-    listener: KeyboardListener,
+    listener: Box<dyn RawSource>,
     machine: ModifierTrigger,
     /// The transcribe binding, e.g. "option+space".
     hotkey_string: String,
@@ -75,25 +75,14 @@ struct ModifierTriggerRuntime {
 impl ModifierTriggerRuntime {
     /// The trigger for the transcribe binding `hotkey_string`, if the setting
     /// is on and the binding has modifiers and a key.
-    fn build(app: &AppHandle, hotkey_string: &str) -> Option<Self> {
-        // Elsewhere a bare modifier can't pass through harmlessly: on Windows a
-        // lone Alt tap opens the menu bar of the app in front.
-        if !cfg!(target_os = "macos") {
-            return None;
-        }
-        let settings = get_settings(app);
-        if !settings.modifier_alone_trigger {
-            return None;
-        }
+    fn build(effects: &impl Effects, keys: &impl KeySource, hotkey_string: &str) -> Option<Self> {
+        let hold_threshold = effects.modifier_trigger()?;
         let chord: Hotkey = hotkey_string.parse().ok()?;
-        let machine = ModifierTrigger::new(
-            chord,
-            std::time::Duration::from_millis(settings.hold_threshold_ms),
-        )?;
+        let machine = ModifierTrigger::new(chord, hold_threshold)?;
         // Created after the manager's tap: both insert at the head of the
         // session taps, so this one sees the chord's key before the manager's
         // blocking tap swallows it, which the raw-stream takeover relies on.
-        let listener = match KeyboardListener::new() {
+        let listener = match keys.raw_listener() {
             Ok(listener) => listener,
             Err(e) => {
                 error!("Failed to start the modifier-alone listener: {e}");
@@ -109,46 +98,48 @@ impl ModifierTriggerRuntime {
     }
 
     /// Tear the trigger down, releasing a press still held.
-    fn stop(mut self, app: &AppHandle) {
+    fn stop(mut self, effects: &impl Effects) {
         if let Some(action) = self.machine.abandon(std::time::Instant::now()) {
-            apply_trigger_action(app, &self.hotkey_string, action);
+            effects.trigger(&self.hotkey_string, action);
         }
     }
 
     /// Replace `current` with the trigger the settings now ask for. A change
     /// of hold threshold alone keeps the running trigger and its listener.
-    fn rebuild(current: &mut Option<Self>, app: &AppHandle, hotkey_string: Option<&str>) {
-        let settings = get_settings(app);
-        if let Some(trigger) = current.as_mut().filter(|t| {
-            settings.modifier_alone_trigger && Some(t.hotkey_string.as_str()) == hotkey_string
-        }) {
-            trigger
-                .machine
-                .set_hold_threshold(std::time::Duration::from_millis(settings.hold_threshold_ms));
+    fn rebuild(
+        current: &mut Option<Self>,
+        effects: &impl Effects,
+        keys: &impl KeySource,
+        hotkey_string: Option<&str>,
+    ) {
+        let hold_threshold = effects.modifier_trigger();
+        if let Some((trigger, hold_threshold)) = current
+            .as_mut()
+            .filter(|t| Some(t.hotkey_string.as_str()) == hotkey_string)
+            .zip(hold_threshold)
+        {
+            trigger.machine.set_hold_threshold(hold_threshold);
             return;
         }
         if let Some(old) = current.take() {
-            old.stop(app);
+            old.stop(effects);
         }
-        *current = hotkey_string.and_then(|hotkey| Self::build(app, hotkey));
+        *current = hotkey_string.and_then(|hotkey| Self::build(effects, keys, hotkey));
     }
 
     /// Feed the listener's queued events to the machine.
-    fn drain(&mut self, app: &AppHandle) {
+    fn drain(&mut self, effects: &impl Effects) {
         while let Some(event) = self.listener.try_recv() {
             // Only a modifier going down can start anything. Secure Input
             // hides the keys that would discard a press. With no model, every
             // Option keystroke would raise "no model selected"; leave that
             // notice to the shortcut itself.
-            let can_start = event.key.is_some()
-                || !event.is_key_down
-                || (!crate::secure_input::is_enabled_now()
-                    && !get_settings(app).selected_model.is_empty());
+            let can_start = event.key.is_some() || !event.is_key_down || effects.can_start();
             if let Some(action) =
                 self.machine
                     .on_key_event(&event, std::time::Instant::now(), can_start)
             {
-                apply_trigger_action(app, &self.hotkey_string, action);
+                effects.trigger(&self.hotkey_string, action);
             }
         }
     }
@@ -184,6 +175,90 @@ fn apply_trigger_action(app: &AppHandle, hotkey_string: &str, action: TriggerAct
             get_settings(app).shortcut_activation,
         ),
         TriggerAction::Chord { .. } => {}
+    }
+}
+
+/// What the shortcut thread does to the rest of the app: the app itself in
+/// production, a recorder in tests.
+trait Effects {
+    /// A registered binding's chord went down or up.
+    fn shortcut(&self, binding_id: &str, hotkey_string: &str, pressed: bool);
+    /// The modifier trigger of the transcribe binding `hotkey_string` acts.
+    fn trigger(&self, hotkey_string: &str, action: TriggerAction);
+    /// The hold threshold, while the "modifier alone" trigger is on.
+    fn modifier_trigger(&self) -> Option<std::time::Duration>;
+    /// Whether a bare modifier going down may start dictation now.
+    fn can_start(&self) -> bool;
+    /// The thread woke up to look for work.
+    fn woke(&self) {}
+}
+
+impl Effects for AppHandle {
+    fn shortcut(&self, binding_id: &str, hotkey_string: &str, pressed: bool) {
+        handle_shortcut_event(self, binding_id, hotkey_string, pressed);
+    }
+
+    fn trigger(&self, hotkey_string: &str, action: TriggerAction) {
+        apply_trigger_action(self, hotkey_string, action);
+    }
+
+    fn modifier_trigger(&self) -> Option<std::time::Duration> {
+        // Elsewhere a bare modifier can't pass through harmlessly: on Windows a
+        // lone Alt tap opens the menu bar of the app in front.
+        if !cfg!(target_os = "macos") {
+            return None;
+        }
+        let settings = get_settings(self);
+        settings
+            .modifier_alone_trigger
+            .then(|| std::time::Duration::from_millis(settings.hold_threshold_ms))
+    }
+
+    fn can_start(&self) -> bool {
+        !crate::secure_input::is_enabled_now() && !get_settings(self).selected_model.is_empty()
+    }
+}
+
+/// The hotkey manager and the trigger's raw listener, as the thread uses them.
+trait KeySource {
+    type Id: Copy + Eq + std::hash::Hash;
+    fn register(&self, hotkey: Hotkey) -> Result<Self::Id, String>;
+    fn unregister(&self, id: Self::Id) -> Result<(), String>;
+    /// A queued chord edge: the hotkey and whether it went down.
+    fn try_recv(&self) -> Option<(Self::Id, bool)>;
+    /// A listener that sees every key and blocks none.
+    fn raw_listener(&self) -> Result<Box<dyn RawSource>, String>;
+}
+
+trait RawSource {
+    fn try_recv(&self) -> Option<KeyEvent>;
+}
+
+impl RawSource for KeyboardListener {
+    fn try_recv(&self) -> Option<KeyEvent> {
+        KeyboardListener::try_recv(self)
+    }
+}
+
+impl KeySource for HotkeyManager {
+    type Id = HotkeyId;
+
+    fn register(&self, hotkey: Hotkey) -> Result<HotkeyId, String> {
+        HotkeyManager::register(self, hotkey).map_err(|e| e.to_string())
+    }
+
+    fn unregister(&self, id: HotkeyId) -> Result<(), String> {
+        HotkeyManager::unregister(self, id).map_err(|e| e.to_string())
+    }
+
+    fn try_recv(&self) -> Option<(HotkeyId, bool)> {
+        HotkeyManager::try_recv(self).map(|event| (event.id, event.state == HotkeyState::Pressed))
+    }
+
+    fn raw_listener(&self) -> Result<Box<dyn RawSource>, String> {
+        Ok(Box::new(
+            KeyboardListener::new().map_err(|e| e.to_string())?,
+        ))
     }
 }
 
@@ -243,29 +318,33 @@ impl HandyKeysState {
     }
 
     /// The main manager thread - owns the HotkeyManager and processes commands
-    fn manager_thread(cmd_rx: Receiver<ManagerCommand>, app: AppHandle, manager: HotkeyManager) {
+    fn manager_thread<K: KeySource>(
+        cmd_rx: Receiver<ManagerCommand>,
+        effects: impl Effects,
+        manager: K,
+    ) {
         info!("handy-keys manager thread started");
 
         // Maps binding IDs to HotkeyIds and hotkey strings
-        let mut binding_to_hotkey: HashMap<String, HotkeyId> = HashMap::new();
-        let mut hotkey_to_binding: HashMap<HotkeyId, (String, String)> = HashMap::new(); // (binding_id, hotkey_string)
+        let mut binding_to_hotkey: HashMap<String, K::Id> = HashMap::new();
+        let mut hotkey_to_binding: HashMap<K::Id, (String, String)> = HashMap::new(); // (binding_id, hotkey_string)
         let mut modifier_trigger: Option<ModifierTriggerRuntime> = None;
 
         loop {
+            effects.woke();
             // Raw events first: a modifier went down before the chord it is
             // part of, so the trigger must see it before the chord's event.
             if let Some(trigger) = modifier_trigger.as_mut() {
-                trigger.drain(&app);
+                trigger.drain(&effects);
             }
 
             // Check for hotkey events (non-blocking)
-            while let Some(event) = manager.try_recv() {
-                if let Some((binding_id, hotkey_string)) = hotkey_to_binding.get(&event.id) {
+            while let Some((id, is_pressed)) = manager.try_recv() {
+                if let Some((binding_id, hotkey_string)) = hotkey_to_binding.get(&id) {
                     debug!(
-                        "handy-keys event: binding={}, hotkey={}, state={:?}",
-                        binding_id, hotkey_string, event.state
+                        "handy-keys event: binding={}, hotkey={}, pressed={}",
+                        binding_id, hotkey_string, is_pressed
                     );
-                    let is_pressed = event.state == HotkeyState::Pressed;
                     if let Some(trigger) = modifier_trigger
                         .as_mut()
                         .filter(|_| binding_id == TRANSCRIBE)
@@ -274,11 +353,11 @@ impl HandyKeysState {
                             .machine
                             .on_chord(is_pressed, std::time::Instant::now())
                         {
-                            apply_trigger_action(&app, hotkey_string, action);
+                            effects.trigger(hotkey_string, action);
                         }
                         continue;
                     }
-                    handle_shortcut_event(&app, binding_id, hotkey_string, is_pressed);
+                    effects.shortcut(binding_id, hotkey_string, is_pressed);
                 }
             }
 
@@ -300,7 +379,8 @@ impl HandyKeysState {
                         if result.is_ok() && binding_id == TRANSCRIBE {
                             ModifierTriggerRuntime::rebuild(
                                 &mut modifier_trigger,
-                                &app,
+                                &effects,
+                                &manager,
                                 Some(&hotkey_string),
                             );
                         }
@@ -319,7 +399,12 @@ impl HandyKeysState {
                         if binding_id == TRANSCRIBE {
                             // Also while capturing a new shortcut: pressing
                             // Option then must not start dictation.
-                            ModifierTriggerRuntime::rebuild(&mut modifier_trigger, &app, None);
+                            ModifierTriggerRuntime::rebuild(
+                                &mut modifier_trigger,
+                                &effects,
+                                &manager,
+                                None,
+                            );
                         }
                         let _ = response.send(result);
                     }
@@ -330,7 +415,8 @@ impl HandyKeysState {
                             .map(|(_, hotkey)| hotkey.clone());
                         ModifierTriggerRuntime::rebuild(
                             &mut modifier_trigger,
-                            &app,
+                            &effects,
+                            &manager,
                             transcribe.as_deref(),
                         );
                     }
@@ -353,10 +439,10 @@ impl HandyKeysState {
     }
 
     /// Register a hotkey
-    fn do_register(
-        manager: &HotkeyManager,
-        binding_to_hotkey: &mut HashMap<String, HotkeyId>,
-        hotkey_to_binding: &mut HashMap<HotkeyId, (String, String)>,
+    fn do_register<K: KeySource>(
+        manager: &K,
+        binding_to_hotkey: &mut HashMap<String, K::Id>,
+        hotkey_to_binding: &mut HashMap<K::Id, (String, String)>,
         binding_id: &str,
         hotkey_string: &str,
     ) -> Result<(), String> {
@@ -379,10 +465,10 @@ impl HandyKeysState {
     }
 
     /// Unregister a hotkey
-    fn do_unregister(
-        manager: &HotkeyManager,
-        binding_to_hotkey: &mut HashMap<String, HotkeyId>,
-        hotkey_to_binding: &mut HashMap<HotkeyId, (String, String)>,
+    fn do_unregister<K: KeySource>(
+        manager: &K,
+        binding_to_hotkey: &mut HashMap<String, K::Id>,
+        hotkey_to_binding: &mut HashMap<K::Id, (String, String)>,
         binding_id: &str,
     ) -> Result<(), String> {
         if let Some(id) = binding_to_hotkey.remove(binding_id) {
@@ -712,4 +798,326 @@ pub fn stop_handy_keys_recording(app: AppHandle) -> Result<(), String> {
     let result = state.stop_recording();
     super::resume_all_shortcuts(&app);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    //! The shortcut thread driven through `manager_thread` with fake key
+    //! sources. Real
+    //! listeners need the Accessibility permission, so none is created here.
+
+    use super::*;
+    use handy_keys::{Key, Modifiers};
+    use std::sync::atomic::{AtomicU32, AtomicUsize};
+    use std::time::{Duration, Instant};
+
+    const THRESHOLD: Duration = Duration::from_millis(300);
+    const OPT: Modifiers = Modifiers::OPT_LEFT;
+    const WAIT: Duration = Duration::from_secs(2);
+
+    /// What the thread asked of the app.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Did {
+        Shortcut(&'static str, bool),
+        Trigger(TriggerAction),
+    }
+
+    struct Recorder {
+        did: Sender<(Did, Instant)>,
+        wakes: Arc<AtomicUsize>,
+        trigger: Option<Duration>,
+    }
+
+    fn binding(id: &str) -> &'static str {
+        match id {
+            "transcribe" => "transcribe",
+            "cancel" => "cancel",
+            _ => "other",
+        }
+    }
+
+    impl Effects for Recorder {
+        fn shortcut(&self, binding_id: &str, _: &str, pressed: bool) {
+            let _ = self
+                .did
+                .send((Did::Shortcut(binding(binding_id), pressed), Instant::now()));
+        }
+        fn trigger(&self, _: &str, action: TriggerAction) {
+            let _ = self.did.send((Did::Trigger(action), Instant::now()));
+        }
+        fn modifier_trigger(&self) -> Option<Duration> {
+            self.trigger
+        }
+        fn can_start(&self) -> bool {
+            true
+        }
+        fn woke(&self) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The hotkey manager and raw listener, fed by the test.
+    struct FakeKeys {
+        next_id: AtomicU32,
+        chords: Receiver<(u32, bool)>,
+        raw: Mutex<Option<Receiver<KeyEvent>>>,
+    }
+
+    struct FakeRaw(Receiver<KeyEvent>);
+
+    impl RawSource for FakeRaw {
+        fn try_recv(&self) -> Option<KeyEvent> {
+            self.0.try_recv().ok()
+        }
+    }
+
+    impl KeySource for FakeKeys {
+        type Id = u32;
+        fn register(&self, _: Hotkey) -> Result<u32, String> {
+            Ok(self.next_id.fetch_add(1, Ordering::SeqCst))
+        }
+        fn unregister(&self, _: u32) -> Result<(), String> {
+            Ok(())
+        }
+        fn try_recv(&self) -> Option<(u32, bool)> {
+            self.chords.try_recv().ok()
+        }
+        fn raw_listener(&self) -> Result<Box<dyn RawSource>, String> {
+            let raw = self.raw.lock().unwrap().take().ok_or("taken")?;
+            Ok(Box::new(FakeRaw(raw)))
+        }
+    }
+
+    struct Harness {
+        cmd: Option<Sender<ManagerCommand>>,
+        raw: Sender<KeyEvent>,
+        chords: Sender<(u32, bool)>,
+        did: Receiver<(Did, Instant)>,
+        wakes: Arc<AtomicUsize>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Harness {
+        fn start(trigger: Option<Duration>) -> Self {
+            let (cmd_tx, cmd_rx) = mpsc::channel();
+            let (raw_tx, raw_rx) = mpsc::channel();
+            let (chord_tx, chord_rx) = mpsc::channel();
+            let (did_tx, did_rx) = mpsc::channel();
+            let wakes = Arc::new(AtomicUsize::new(0));
+            let effects = Recorder {
+                did: did_tx,
+                wakes: Arc::clone(&wakes),
+                trigger,
+            };
+            let keys = FakeKeys {
+                next_id: AtomicU32::new(0),
+                chords: chord_rx,
+                raw: Mutex::new(Some(raw_rx)),
+            };
+            let thread =
+                thread::spawn(move || HandyKeysState::manager_thread(cmd_rx, effects, keys));
+            Self {
+                cmd: Some(cmd_tx),
+                raw: raw_tx,
+                chords: chord_tx,
+                did: did_rx,
+                wakes,
+                thread: Some(thread),
+            }
+        }
+
+        fn command(&self, cmd: ManagerCommand) {
+            self.cmd.as_ref().unwrap().send(cmd).unwrap();
+        }
+
+        fn register(&self, binding_id: &str, hotkey: &str) {
+            let (tx, rx) = mpsc::channel();
+            self.command(ManagerCommand::Register {
+                binding_id: binding_id.into(),
+                hotkey_string: hotkey.into(),
+                response: tx,
+            });
+            rx.recv_timeout(WAIT).unwrap().unwrap();
+        }
+
+        /// A key as the listener reports it.
+        fn key(&self, event: KeyEvent) {
+            self.raw.send(event).unwrap();
+        }
+
+        /// The hotkey manager's report of the `n`th registered chord.
+        fn chord(&self, n: u32, pressed: bool) {
+            self.chords.send((n, pressed)).unwrap();
+        }
+
+        fn next(&self) -> (Did, Instant) {
+            self.did.recv_timeout(WAIT).expect("nothing dispatched")
+        }
+
+        fn assert_quiet(&self) {
+            if let Ok(did) = self.did.recv_timeout(Duration::from_millis(50)) {
+                panic!("unexpected {did:?}");
+            }
+        }
+
+        /// Whether the thread ends within `WAIT`.
+        fn stops(&mut self) -> bool {
+            let thread = self.thread.take().unwrap();
+            let t0 = Instant::now();
+            while !thread.is_finished() && t0.elapsed() < WAIT {
+                thread::sleep(Duration::from_millis(1));
+            }
+            thread.is_finished()
+        }
+    }
+
+    fn mods(modifiers: Modifiers, down: bool) -> KeyEvent {
+        KeyEvent {
+            modifiers,
+            key: None,
+            is_key_down: down,
+            changed_modifier: None,
+        }
+    }
+
+    fn key(modifiers: Modifiers, key: Key, down: bool) -> KeyEvent {
+        KeyEvent {
+            modifiers,
+            key: Some(key),
+            is_key_down: down,
+            changed_modifier: None,
+        }
+    }
+
+    fn percentile(sorted: &[Duration], p: usize) -> Duration {
+        sorted[(sorted.len() - 1) * p / 100]
+    }
+
+    #[test]
+    fn idle_thread_wakeups_in_one_second() {
+        let h = Harness::start(Some(THRESHOLD));
+        h.register(TRANSCRIBE, "option+space");
+        thread::sleep(Duration::from_millis(100));
+        let before = h.wakes.load(Ordering::SeqCst);
+        thread::sleep(Duration::from_secs(1));
+        let wakes = h.wakes.load(Ordering::SeqCst) - before;
+        println!("idle wakeups in 1 s: {wakes}");
+        // Polls every 10 ms.
+        assert!(wakes > 10, "{wakes}");
+    }
+
+    #[test]
+    fn key_to_dispatch_latency() {
+        let h = Harness::start(Some(THRESHOLD));
+        h.register(TRANSCRIBE, "option+space");
+        let mut dispatch = Vec::new();
+        let mut stamp = Vec::new();
+        for i in 0..200u64 {
+            // Land at a different point of any poll period each time.
+            thread::sleep(Duration::from_micros(200 + (i * 7919) % 10_000));
+            let t0 = Instant::now();
+            h.key(mods(OPT, true));
+            let (did, done) = h.next();
+            let Did::Trigger(TriggerAction::Press { at }) = did else {
+                panic!("{did:?}");
+            };
+            dispatch.push(done - t0);
+            stamp.push(at - t0);
+            h.key(mods(Modifiers::empty(), false));
+            assert!(matches!(
+                h.next().0,
+                Did::Trigger(TriggerAction::Release { .. })
+            ));
+        }
+        dispatch.sort();
+        stamp.sort();
+        println!(
+            "key -> dispatch over 200: median {:?}, max {:?}; key -> press timestamp: median {:?}, max {:?}",
+            percentile(&dispatch, 50),
+            dispatch[199],
+            percentile(&stamp, 50),
+            stamp[199],
+        );
+        assert!(percentile(&dispatch, 50) < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn raw_keys_reach_the_trigger_before_the_chord() {
+        let h = Harness::start(Some(THRESHOLD));
+        h.register(TRANSCRIBE, "option+space");
+        // Option, Space and the manager's report of Option+Space, all queued
+        // before the thread looks.
+        h.key(mods(OPT, true));
+        h.key(key(OPT, Key::Space, true));
+        h.chord(0, true);
+        assert!(matches!(
+            h.next().0,
+            Did::Trigger(TriggerAction::Press { .. })
+        ));
+        assert!(matches!(
+            h.next().0,
+            Did::Trigger(TriggerAction::Rebase { .. })
+        ));
+        // The manager's report of the Space the raw stream handed over is
+        // absorbed; the chord's release passes on.
+        h.assert_quiet();
+        h.key(key(OPT, Key::Space, false));
+        h.chord(0, false);
+        assert_eq!(
+            h.next().0,
+            Did::Trigger(TriggerAction::Chord { pressed: false })
+        );
+        h.key(mods(Modifiers::empty(), false));
+        h.assert_quiet();
+    }
+
+    #[test]
+    fn chord_only_bindings_dispatch_without_a_trigger() {
+        let h = Harness::start(None);
+        h.register(TRANSCRIBE, "option+space");
+        h.register("cancel", "escape");
+        h.key(key(Modifiers::empty(), Key::Escape, true));
+        h.chord(1, true);
+        assert_eq!(h.next().0, Did::Shortcut("cancel", true));
+        h.key(key(Modifiers::empty(), Key::Escape, false));
+        h.chord(1, false);
+        assert_eq!(h.next().0, Did::Shortcut("cancel", false));
+        h.key(mods(OPT, true));
+        h.key(key(OPT, Key::Space, true));
+        h.chord(0, true);
+        assert_eq!(h.next().0, Did::Shortcut("transcribe", true));
+        h.assert_quiet();
+    }
+
+    #[test]
+    fn commands_are_answered_while_keys_are_idle() {
+        let h = Harness::start(Some(THRESHOLD));
+        for n in 0..20 {
+            let t0 = Instant::now();
+            h.register(&format!("binding{n}"), &format!("ctrl+f{}", n % 12 + 1));
+            assert!(t0.elapsed() < Duration::from_millis(500));
+        }
+        let (tx, rx) = mpsc::channel();
+        h.command(ManagerCommand::Unregister {
+            binding_id: "binding0".into(),
+            response: tx,
+        });
+        assert_eq!(rx.recv_timeout(WAIT).unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn stops_on_shutdown() {
+        let mut h = Harness::start(Some(THRESHOLD));
+        h.register(TRANSCRIBE, "option+space");
+        h.command(ManagerCommand::Shutdown);
+        assert!(h.stops());
+    }
+
+    #[test]
+    fn stops_when_the_command_sender_is_dropped() {
+        let mut h = Harness::start(Some(THRESHOLD));
+        h.register(TRANSCRIBE, "option+space");
+        h.cmd = None;
+        assert!(h.stops());
+    }
 }
