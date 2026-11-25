@@ -90,6 +90,9 @@ impl ModifierTriggerRuntime {
             chord,
             std::time::Duration::from_millis(settings.hold_threshold_ms),
         )?;
+        // Created after the manager's tap: both insert at the head of the
+        // session taps, so this one sees the chord's key before the manager's
+        // blocking tap swallows it, which the raw-stream takeover relies on.
         let listener = match KeyboardListener::new() {
             Ok(listener) => listener,
             Err(e) => {
@@ -133,8 +136,12 @@ impl ModifierTriggerRuntime {
     /// Feed the listener's queued events to the machine.
     fn drain(&mut self, app: &AppHandle) {
         while let Some(event) = self.listener.try_recv() {
-            // Secure Input hides the keys that would discard a press.
-            let can_start = event.key.is_some() || !crate::secure_input::is_enabled_now();
+            // Secure Input hides the keys that would discard a press. With no
+            // model, every Option keystroke would raise "no model selected";
+            // leave that notice to the shortcut itself.
+            let can_start = event.key.is_some()
+                || (!crate::secure_input::is_enabled_now()
+                    && !get_settings(app).selected_model.is_empty());
             if let Some(action) =
                 self.machine
                     .on_key_event(&event, std::time::Instant::now(), can_start)
@@ -157,11 +164,7 @@ fn apply_trigger_action(app: &AppHandle, hotkey_string: &str, action: TriggerAct
     match action {
         TriggerAction::Press { at } | TriggerAction::Release { at } => {
             let settings = get_settings(app);
-            // Every Option keystroke would raise "no model selected".
             let pressed = matches!(action, TriggerAction::Press { .. });
-            if pressed && settings.selected_model.is_empty() {
-                return;
-            }
             coordinator.send_trigger_input(
                 TRANSCRIBE,
                 hotkey_string,

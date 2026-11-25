@@ -560,6 +560,11 @@ impl CoordinatorState {
     /// recording must be abandoned. A press that stopped a session started
     /// nothing, so a transcription already running is never touched.
     fn on_discard(&mut self, binding_id: &str, pressed_at: Instant) -> bool {
+        // A discarded press must not debounce the chord that follows it
+        // (Option, Shift, Space within 30ms for option+shift+space).
+        if self.last_press == Some(pressed_at) {
+            self.last_press = None;
+        }
         if self
             .pending_press
             .as_ref()
@@ -569,11 +574,6 @@ impl CoordinatorState {
             self.pending_press = None;
             self.drop_pending_release(binding_id);
             return false;
-        }
-        // A discarded press must not debounce the chord that follows it
-        // (Option, Shift, Space within 30ms for option+shift+space).
-        if self.last_press == Some(pressed_at) {
-            self.last_press = None;
         }
         let started_it = matches!(&self.stage, Stage::Recording(id) if id == binding_id)
             && self
@@ -1968,6 +1968,7 @@ mod tests {
         assert!(state.pending_press.is_some());
         assert!(!state.on_discard(BINDING, pressed));
         assert!(state.pending_press.is_none());
+        assert!(state.last_press != Some(pressed));
         assert!(state.on_processing_finished().is_none());
         assert_eq!(state.stage, Stage::Idle);
     }
