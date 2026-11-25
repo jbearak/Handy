@@ -569,8 +569,8 @@ mod tests {
         let held = ms(t0, 500);
         t.on_key_event(&mods(OPT, true), held, true);
         for n in 0..2u64 {
-            assert_eq!(t.on_chord(true, ms(t0, 510 + n)), None);
-            t.on_chord(false, ms(t0, 520 + n));
+            assert_eq!(t.on_chord(true, ms(t0, 510 + 2 * n)), None);
+            t.on_chord(false, ms(t0, 511 + 2 * n));
         }
         // The bare hold is still its own: typing discards it.
         assert_eq!(
