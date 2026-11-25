@@ -1,10 +1,8 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::apple_intelligence;
-use crate::audio_feedback::{
-    play_feedback_sound, play_feedback_sound_blocking, prepare_feedback_output, SoundType,
-};
+use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, SoundType};
 use crate::audio_toolkit::VadPolicy;
-use crate::managers::audio::{recording_notice_code, AudioRecordingManager};
+use crate::managers::audio::{recording_notice_code, AudioRecordingManager, RecordingReadiness};
 use crate::managers::history::HistoryManager;
 use crate::managers::model::ModelManager;
 use crate::managers::transcription::policy::{live_decode, LiveDecode, ModelTraits};
@@ -515,55 +513,190 @@ pub(crate) async fn process_transcription_output(
     }
 }
 
-impl ShortcutAction for TranscribeAction {
-    fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
-        let start_time = Instant::now();
-        debug!("TranscribeAction::start called for binding: {}", binding_id);
+/// What starting a dictation needs from the app, one method per step, so the
+/// order of the steps can be tested without an `AppHandle`.
+pub(crate) trait StartSteps: Clone + Send + 'static {
+    /// Whether a session can start. Raises its own notice when it can't.
+    fn can_start(&self) -> bool;
+    /// Whether the microphone is already in a session, which refuses the
+    /// start.
+    fn is_recording(&self) -> bool;
+    /// Tray, live-stream plan and overlay: everything shown before the mic
+    /// opens. Returns how the session's audio is filtered.
+    fn prepare_session(&self) -> VadPolicy;
+    /// Starts capture. Blocks while an on-demand microphone opens.
+    fn start_recording(&self, vad_policy: VadPolicy) -> anyhow::Result<RecordingReadiness>;
+    /// Whether `generation` is still the live capture (not stopped or
+    /// cancelled since).
+    fn is_current(&self, generation: u64) -> bool;
+    /// Tells the overlay the microphone is delivering audio.
+    fn emit_ready(&self);
+    /// Plays the start sound to its end; returns at once when feedback is off.
+    fn play_start_sound(&self);
+    /// Mutes system audio for the capture `generation`, unless it has been
+    /// stopped or cancelled since.
+    fn apply_mute(&self, generation: u64);
+}
 
-        // Load model in the background
-        let tm = app.state::<Arc<TranscriptionManager>>();
-        let rm = app.state::<Arc<AudioRecordingManager>>();
+pub(crate) enum StartOutcome {
+    /// Nothing started; the refusal already told the user why.
+    Refused,
+    /// The microphone couldn't start.
+    Failed(anyhow::Error),
+    /// Capture started; the worker waits for the first audio.
+    Started(std::thread::JoinHandle<()>),
+}
 
-        // Load ASR model and VAD model in parallel
-        let kickoff_started = Instant::now();
-        // An empty selection has nothing to load; the check below says so.
-        let selected_model = get_settings(app).selected_model;
-        let load_started = !selected_model.is_empty() && tm.initiate_model_load(true);
-        let rm_clone = Arc::clone(&rm);
-        std::thread::spawn(move || {
-            if let Err(e) = rm_clone.preload_vad() {
-                debug!("VAD pre-load failed: {}", e);
-            }
-        });
-        let kickoff_elapsed = kickoff_started.elapsed();
+/// The start sequence of a dictation, in order.
+pub(crate) fn run_start<S: StartSteps>(steps: S) -> StartOutcome {
+    if !steps.can_start() {
+        return StartOutcome::Refused;
+    }
+    // The start sound says the press was taken, so it plays now, while the
+    // microphone may still be opening; the overlay turning to recording is
+    // the mic-ready cue. Its own thread opens the feedback output if needed.
+    // A microphone already in a session refuses the start below, so that
+    // press gets no sound.
+    let start_sound = (!steps.is_recording())
+        .then(|| {
+            let steps = steps.clone();
+            std::thread::Builder::new()
+                .name("start-sound".into())
+                .spawn(move || steps.play_start_sound())
+                .map_err(|e| warn!("Failed to spawn the start sound thread: {e}"))
+                .ok()
+        })
+        .flatten();
+    let vad_policy = steps.prepare_session();
 
-        // Don't open the mic if nothing can transcribe the recording. A load
-        // started above reports its own failure; one already running doesn't.
-        if !tm.is_model_loaded() {
-            if selected_model.is_empty() {
-                warn!("Not starting recording: no model is selected");
-                tm.raise_no_model_selected();
-                return;
-            }
-            if let Err(e) = app
-                .state::<Arc<ModelManager>>()
-                .get_model_path(&selected_model)
-            {
-                warn!("Not starting recording: no model can transcribe it ({})", e);
-                if !load_started {
-                    tm.raise_model_load_failed(&selected_model, &e);
-                }
-                return;
+    let recording_start_time = Instant::now();
+    let readiness = match steps.start_recording(vad_policy) {
+        Ok(readiness) => readiness,
+        Err(e) => {
+            debug!("Failed to start recording: {}", e);
+            return StartOutcome::Failed(e);
+        }
+    };
+    debug!(
+        "Recording request accepted in {:?}; waiting for first microphone samples",
+        recording_start_time.elapsed()
+    );
+    let generation = readiness.generation();
+    StartOutcome::Started(std::thread::spawn(move || {
+        if !readiness.wait() {
+            debug!("Microphone readiness wait ended without receiving samples");
+            return;
+        }
+
+        // Development-only preview hook for evaluating the brief
+        // arming animation on hardware that normally starts too fast
+        // to make it visible.
+        #[cfg(debug_assertions)]
+        if let Ok(delay_ms) = std::env::var("HANDY_DEBUG_MIC_READY_DELAY_MS")
+            .unwrap_or_default()
+            .parse::<u64>()
+        {
+            let delay_ms = delay_ms.min(10_000);
+            if delay_ms > 0 {
+                debug!("Delaying microphone-ready cue by {delay_ms}ms for UI preview");
+                std::thread::sleep(Duration::from_millis(delay_ms));
             }
         }
 
-        let binding_id = binding_id.to_string();
+        if !steps.is_current(generation) {
+            debug!("Microphone became ready for an inactive recording");
+            return;
+        }
+
+        debug!("Microphone is receiving samples; recording is ready");
+        steps.emit_ready();
+
+        // Mute no earlier than the end of the start sound (0.3-0.6 s, often
+        // longer than the microphone takes to open), so its tail isn't cut
+        // off. Ready above doesn't wait for it.
+        if let Some(start_sound) = start_sound {
+            let _ = start_sound.join();
+        }
+        steps.apply_mute(generation);
+    }))
+}
+
+/// [`StartSteps`] on the running app.
+#[derive(Clone)]
+struct AppStartSteps {
+    app: AppHandle,
+    binding_id: String,
+    selected_model: String,
+}
+
+impl AppStartSteps {
+    /// Starts loading the model and the VAD in the background. Returns
+    /// whether a model load started here, which reports its own failure.
+    fn kick_off_loads(&self) -> bool {
+        let started = Instant::now();
+        // An empty selection has nothing to load; `can_start` says so.
+        let load_started = !self.selected_model.is_empty()
+            && self
+                .app
+                .state::<Arc<TranscriptionManager>>()
+                .initiate_model_load(true);
+        let rm = Arc::clone(&self.app.state::<Arc<AudioRecordingManager>>());
+        std::thread::spawn(move || {
+            if let Err(e) = rm.preload_vad() {
+                debug!("VAD pre-load failed: {}", e);
+            }
+        });
+        debug!("start-path model_kickoff={:?}", started.elapsed());
+        load_started
+    }
+}
+
+impl StartSteps for AppStartSteps {
+    fn can_start(&self) -> bool {
+        let tm = self.app.state::<Arc<TranscriptionManager>>();
+        // Don't open the mic if nothing can transcribe the recording. A load
+        // started by this start reports its own failure; one already running
+        // doesn't. An accepted start kicks off its loads after the start
+        // sound, in `prepare_session`.
+        if tm.is_model_loaded() {
+            return true;
+        }
+        if self.selected_model.is_empty() {
+            self.kick_off_loads();
+            warn!("Not starting recording: no model is selected");
+            tm.raise_no_model_selected();
+            return false;
+        }
+        if let Err(e) = self
+            .app
+            .state::<Arc<ModelManager>>()
+            .get_model_path(&self.selected_model)
+        {
+            let load_started = self.kick_off_loads();
+            warn!("Not starting recording: no model can transcribe it ({})", e);
+            if !load_started {
+                tm.raise_model_load_failed(&self.selected_model, &e);
+            }
+            return false;
+        }
+        true
+    }
+
+    fn is_recording(&self) -> bool {
+        self.app
+            .state::<Arc<AudioRecordingManager>>()
+            .is_recording()
+    }
+
+    fn prepare_session(&self) -> VadPolicy {
+        self.kick_off_loads();
+        let app = &self.app;
+        let tm = app.state::<Arc<TranscriptionManager>>();
         RECORDING_SESSION.fetch_add(1, Ordering::SeqCst);
         let tray_started = Instant::now();
         set_tray_state(app, TrayIconState::Recording);
         let tray_elapsed = tray_started.elapsed();
 
-        // Get the microphone mode to determine audio feedback timing
         let plan_started = Instant::now();
         let settings = get_settings(app);
         let is_always_on = settings.always_on_microphone;
@@ -610,84 +743,64 @@ impl ShortcutAction for TranscribeAction {
         // Everything above runs before capture can begin, so each span here is
         // added keypress->capture latency.
         debug!(
-            "start-path pre-recording steps: model_kickoff={:?} tray={:?} settings+stream_plan={:?} overlay={:?}",
-            kickoff_elapsed,
+            "start-path pre-recording steps: tray={:?} settings+stream_plan={:?} overlay={:?}",
             tray_elapsed,
             plan_elapsed,
             overlay_started.elapsed()
         );
         debug!("Microphone mode - always_on: {}", is_always_on);
+        vad_policy
+    }
 
-        // The start sound plays once the mic is ready; have its output open by then.
-        prepare_feedback_output(&settings);
+    fn start_recording(&self, vad_policy: VadPolicy) -> anyhow::Result<RecordingReadiness> {
+        self.app
+            .state::<Arc<AudioRecordingManager>>()
+            .try_start_recording(&self.binding_id, vad_policy)
+    }
 
-        let mut recording_error: Option<anyhow::Error> = None;
-        let recording_start_time = Instant::now();
-        match rm.try_start_recording(&binding_id, vad_policy) {
-            Ok(readiness) => {
-                debug!(
-                    "Recording request accepted in {:?}; waiting for first microphone samples",
-                    recording_start_time.elapsed()
-                );
-                let generation = readiness.generation();
-                let app_clone = app.clone();
-                let rm_clone = Arc::clone(&rm);
-                std::thread::spawn(move || {
-                    if !readiness.wait() {
-                        debug!("Microphone readiness wait ended without receiving samples");
-                        return;
-                    }
+    fn is_current(&self, generation: u64) -> bool {
+        self.app
+            .state::<Arc<AudioRecordingManager>>()
+            .is_recording_readiness_current(generation)
+    }
 
-                    // Development-only preview hook for evaluating the brief
-                    // arming animation on hardware that normally starts too fast
-                    // to make it visible.
-                    #[cfg(debug_assertions)]
-                    if let Ok(delay_ms) = std::env::var("HANDY_DEBUG_MIC_READY_DELAY_MS")
-                        .unwrap_or_default()
-                        .parse::<u64>()
-                    {
-                        let delay_ms = delay_ms.min(10_000);
-                        if delay_ms > 0 {
-                            debug!("Delaying microphone-ready cue by {delay_ms}ms for UI preview");
-                            std::thread::sleep(Duration::from_millis(delay_ms));
-                        }
-                    }
+    fn emit_ready(&self) {
+        utils::emit_recording_ready(&self.app);
+    }
 
-                    if !rm_clone.is_recording_readiness_current(generation) {
-                        debug!("Microphone became ready for an inactive recording");
-                        return;
-                    }
+    fn play_start_sound(&self) {
+        play_feedback_sound_blocking(&self.app, SoundType::Start);
+    }
 
-                    debug!("Microphone is receiving samples; recording is ready");
-                    utils::emit_recording_ready(&app_clone);
+    fn apply_mute(&self, generation: u64) {
+        self.app
+            .state::<Arc<AudioRecordingManager>>()
+            .apply_mute(generation);
+    }
+}
 
-                    // The start chime is a readiness cue, so it must follow the
-                    // first real input callback rather than Stream::play() or a
-                    // fixed delay. The helper returns immediately when feedback
-                    // is disabled; mute still follows the same readiness point.
-                    if rm_clone.is_recording_readiness_current(generation) {
-                        play_feedback_sound_blocking(&app_clone, SoundType::Start);
-                    }
-                    if rm_clone.is_recording_readiness_current(generation) {
-                        rm_clone.apply_mute();
-                    }
-                });
+impl ShortcutAction for TranscribeAction {
+    fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+        let start_time = Instant::now();
+        debug!("TranscribeAction::start called for binding: {}", binding_id);
+
+        let tm = app.state::<Arc<TranscriptionManager>>();
+        let steps = AppStartSteps {
+            app: app.clone(),
+            binding_id: binding_id.to_string(),
+            selected_model: get_settings(app).selected_model,
+        };
+        match run_start(steps) {
+            StartOutcome::Refused => return,
+            StartOutcome::Started(_worker) => {
+                // Dynamically register the cancel shortcut in a separate task to avoid deadlock
+                shortcut::register_cancel_shortcut(app);
             }
-            Err(e) => {
-                debug!("Failed to start recording: {}", e);
-                recording_error = Some(e);
-            }
-        }
-
-        if recording_error.is_none() {
-            // Dynamically register the cancel shortcut in a separate task to avoid deadlock
-            shortcut::register_cancel_shortcut(app);
-        } else {
-            // Starting failed (for example due to blocked microphone permissions).
-            // Revert UI state so we don't stay stuck in the recording overlay.
-            tm.cancel_stream();
-            set_tray_state(app, TrayIconState::Idle);
-            if let Some(err) = recording_error {
+            StartOutcome::Failed(err) => {
+                // Starting failed (for example due to blocked microphone permissions).
+                // Revert UI state so we don't stay stuck in the recording overlay.
+                tm.cancel_stream();
+                set_tray_state(app, TrayIconState::Idle);
                 notices::raise(
                     app,
                     Notice::new(recording_notice_code(&err), NoticeSource::Dictation)
@@ -703,7 +816,7 @@ impl ShortcutAction for TranscribeAction {
     }
 
     fn stop(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
-        // Prevent a slow microphone from emitting a ready event or start chime
+        // Prevent a slow microphone from emitting a ready event or muting
         // after the user has already requested stop.
         app.state::<Arc<AudioRecordingManager>>()
             .invalidate_recording_readiness();
@@ -1308,5 +1421,292 @@ mod tests {
         assert!(!should_use_streaming_overlay(OverlayStyle::Live, false));
         assert!(!should_use_streaming_overlay(OverlayStyle::Minimal, true));
         assert!(!should_use_streaming_overlay(OverlayStyle::None, true));
+    }
+}
+
+#[cfg(test)]
+mod start_order_tests {
+    use super::{run_start, StartOutcome, StartSteps};
+    use crate::audio_toolkit::VadPolicy;
+    use crate::managers::audio::RecordingReadiness;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// How long a step that should happen is waited for.
+    const WAIT: Duration = Duration::from_secs(2);
+    /// How long a step that shouldn't happen yet is watched for.
+    const WATCH: Duration = Duration::from_millis(100);
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Step {
+        MicOpened,
+        Ready,
+        ToneRequested,
+        ToneEnded,
+        Mute,
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mic {
+        Works,
+        /// Already in a session, so the start is refused.
+        Busy,
+        /// Fails to open.
+        Fails,
+    }
+
+    /// Stands in for the app: a microphone whose open waits on a gate, and
+    /// whose first audio comes when the test sends it.
+    struct Fake {
+        can_start: bool,
+        mic: Mic,
+        /// Set once the session is stopped or cancelled.
+        stopped: AtomicBool,
+        mic_gate: Mutex<Option<Receiver<()>>>,
+        first_audio: Mutex<Option<Receiver<()>>>,
+        tone_gate: Mutex<Option<Receiver<()>>>,
+        log: Mutex<Vec<Step>>,
+        events: Mutex<Sender<Step>>,
+    }
+
+    #[derive(Clone)]
+    struct FakeSteps(Arc<Fake>);
+
+    /// The test's side of a [`Fake`]. Dropping a sender releases its gate.
+    struct Controls {
+        mic_gate: Sender<()>,
+        first_audio: Sender<()>,
+        tone_gate: Sender<()>,
+        events: Receiver<Step>,
+    }
+
+    impl Controls {
+        fn wait_for(&self, step: Step, within: Duration) -> bool {
+            let deadline = Instant::now() + within;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match self.events.recv_timeout(left) {
+                    Ok(s) if s == step => return true,
+                    Ok(_) => {}
+                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                        return false
+                    }
+                }
+            }
+        }
+    }
+
+    fn fake(can_start: bool, mic: Mic) -> (FakeSteps, Controls) {
+        let (mic_tx, mic_rx) = mpsc::channel();
+        let (audio_tx, audio_rx) = mpsc::channel();
+        let (tone_tx, tone_rx) = mpsc::channel();
+        let (events_tx, events_rx) = mpsc::channel();
+        let steps = FakeSteps(Arc::new(Fake {
+            can_start,
+            mic,
+            stopped: AtomicBool::new(false),
+            mic_gate: Mutex::new(Some(mic_rx)),
+            first_audio: Mutex::new(Some(audio_rx)),
+            tone_gate: Mutex::new(Some(tone_rx)),
+            log: Mutex::new(Vec::new()),
+            events: Mutex::new(events_tx),
+        }));
+        let controls = Controls {
+            mic_gate: mic_tx,
+            first_audio: audio_tx,
+            tone_gate: tone_tx,
+            events: events_rx,
+        };
+        (steps, controls)
+    }
+
+    impl FakeSteps {
+        fn record(&self, step: Step) {
+            self.0.log.lock().unwrap().push(step);
+            let _ = self.0.events.lock().unwrap().send(step);
+        }
+
+        fn steps(&self) -> Vec<Step> {
+            self.0.log.lock().unwrap().clone()
+        }
+
+        fn count(&self, step: Step) -> usize {
+            self.steps().iter().filter(|s| **s == step).count()
+        }
+
+        /// Where `step` first comes in the order things happened.
+        fn at(&self, step: Step) -> usize {
+            self.steps()
+                .iter()
+                .position(|s| *s == step)
+                .unwrap_or_else(|| panic!("{step:?} never happened"))
+        }
+    }
+
+    /// Waits on the gate until the test sends on it or drops it.
+    fn pass(gate: &Mutex<Option<Receiver<()>>>) {
+        if let Some(gate) = gate.lock().unwrap().take() {
+            let _ = gate.recv();
+        }
+    }
+
+    impl StartSteps for FakeSteps {
+        fn can_start(&self) -> bool {
+            self.0.can_start
+        }
+
+        fn is_recording(&self) -> bool {
+            self.0.mic == Mic::Busy
+        }
+
+        fn prepare_session(&self) -> VadPolicy {
+            // Gated too, so tray and overlay can't come before the sound.
+            pass(&self.0.mic_gate);
+            VadPolicy::Disabled
+        }
+
+        fn start_recording(&self, _: VadPolicy) -> anyhow::Result<RecordingReadiness> {
+            pass(&self.0.mic_gate);
+            match self.0.mic {
+                Mic::Busy => anyhow::bail!("Already recording"),
+                Mic::Fails => anyhow::bail!("Failed to open microphone"),
+                Mic::Works => {}
+            }
+            self.record(Step::MicOpened);
+            let first_audio = self.0.first_audio.lock().unwrap().take();
+            Ok(RecordingReadiness::for_test(
+                first_audio.expect("one start per fake"),
+                1,
+            ))
+        }
+
+        fn is_current(&self, generation: u64) -> bool {
+            generation == 1 && !self.0.stopped.load(Ordering::SeqCst)
+        }
+
+        fn emit_ready(&self) {
+            self.record(Step::Ready);
+        }
+
+        fn play_start_sound(&self) {
+            self.record(Step::ToneRequested);
+            pass(&self.0.tone_gate);
+            self.record(Step::ToneEnded);
+        }
+
+        fn apply_mute(&self, generation: u64) {
+            if self.is_current(generation) {
+                self.record(Step::Mute);
+            }
+        }
+    }
+
+    fn started(outcome: StartOutcome) -> thread::JoinHandle<()> {
+        match outcome {
+            StartOutcome::Started(worker) => worker,
+            StartOutcome::Refused => panic!("start was refused"),
+            StartOutcome::Failed(e) => panic!("start failed: {e}"),
+        }
+    }
+
+    /// The start sound is a key-down cue: it's requested while the
+    /// microphone is still opening, but the overlay's ready event still waits
+    /// for the microphone's first audio. The sound plays once.
+    #[test]
+    fn start_sound_plays_before_the_microphone_opens() {
+        let (steps, controls) = fake(true, Mic::Works);
+        let starter = {
+            let steps = steps.clone();
+            thread::spawn(move || run_start(steps))
+        };
+
+        assert!(
+            controls.wait_for(Step::ToneRequested, WAIT),
+            "the start sound waited for the microphone to open"
+        );
+        assert_eq!(steps.count(Step::MicOpened), 0);
+
+        controls.mic_gate.send(()).unwrap();
+        let worker = started(starter.join().unwrap());
+        assert!(
+            !controls.wait_for(Step::Ready, WATCH),
+            "ready came before the microphone delivered audio"
+        );
+
+        controls.first_audio.send(()).unwrap();
+        controls.tone_gate.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(steps.at(Step::MicOpened) <= steps.at(Step::Ready));
+        assert_eq!(steps.count(Step::Ready), 1);
+        assert_eq!(steps.count(Step::ToneRequested), 1);
+    }
+
+    /// Mute waits for the start sound to end so its tail isn't cut, but the
+    /// ready event doesn't wait for it.
+    #[test]
+    fn mute_follows_the_start_sound_and_ready_does_not_wait_for_it() {
+        let (steps, controls) = fake(true, Mic::Works);
+        controls.mic_gate.send(()).unwrap();
+        controls.first_audio.send(()).unwrap();
+        let worker = started(run_start(steps.clone()));
+
+        assert!(controls.wait_for(Step::Ready, WAIT));
+        assert!(
+            !controls.wait_for(Step::Mute, WATCH),
+            "muted while the start sound was playing"
+        );
+        controls.tone_gate.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(steps.at(Step::ToneEnded) <= steps.at(Step::Mute));
+        assert_eq!(steps.count(Step::ToneRequested), 1);
+        assert_eq!(steps.count(Step::Mute), 1);
+    }
+
+    /// A stop while the start sound is still playing: the worker must not
+    /// mute afterwards, or system audio stays muted past the recording.
+    #[test]
+    fn a_session_stopped_during_the_start_sound_is_not_muted() {
+        let (steps, controls) = fake(true, Mic::Works);
+        controls.mic_gate.send(()).unwrap();
+        controls.first_audio.send(()).unwrap();
+        let worker = started(run_start(steps.clone()));
+
+        assert!(controls.wait_for(Step::Ready, WAIT));
+        steps.0.stopped.store(true, Ordering::SeqCst);
+        controls.tone_gate.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(steps.count(Step::Mute), 0);
+    }
+
+    #[test]
+    fn a_refused_start_plays_nothing_and_opens_nothing() {
+        let (steps, _controls) = fake(false, Mic::Works);
+        assert!(matches!(run_start(steps.clone()), StartOutcome::Refused));
+        assert!(steps.steps().is_empty());
+    }
+
+    #[test]
+    fn a_start_into_a_busy_microphone_plays_nothing() {
+        let (steps, controls) = fake(true, Mic::Busy);
+        drop(controls);
+        assert!(matches!(run_start(steps.clone()), StartOutcome::Failed(_)));
+        assert!(steps.steps().is_empty());
+    }
+
+    /// A microphone that fails to open after the press was taken: the start
+    /// sound has played once, and there's no ready event or mute.
+    #[test]
+    fn a_failed_microphone_open_leaves_only_the_start_sound() {
+        let (steps, controls) = fake(true, Mic::Fails);
+        drop(controls);
+        assert!(matches!(run_start(steps.clone()), StartOutcome::Failed(_)));
+        let deadline = Instant::now() + WAIT;
+        while steps.count(Step::ToneEnded) == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(steps.steps(), [Step::ToneRequested, Step::ToneEnded]);
     }
 }
