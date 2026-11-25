@@ -564,7 +564,7 @@ pub struct AudioRecordingManager {
     /// the main/webview thread when a worker holds `state` across a slow
     /// CoreAudio open/close.
     recording_active: Arc<AtomicBool>,
-    /// Invalidates asynchronous first-sample UI/chime work when a recording is
+    /// Invalidates asynchronous first-sample UI/mute work when a recording is
     /// stopped or cancelled. This prevents a slow device from producing a late
     /// "ready" indication for a session the user already ended.
     capture_generation: Arc<AtomicU64>,
