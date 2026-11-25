@@ -621,8 +621,28 @@ struct AppStartSteps {
     app: AppHandle,
     binding_id: String,
     selected_model: String,
-    /// The start kicked off a model load, which reports its own failure.
-    load_started: bool,
+}
+
+impl AppStartSteps {
+    /// Starts loading the model and the VAD in the background. Returns
+    /// whether a model load started here, which reports its own failure.
+    fn kick_off_loads(&self) -> bool {
+        let started = Instant::now();
+        // An empty selection has nothing to load; `can_start` says so.
+        let load_started = !self.selected_model.is_empty()
+            && self
+                .app
+                .state::<Arc<TranscriptionManager>>()
+                .initiate_model_load(true);
+        let rm = Arc::clone(&self.app.state::<Arc<AudioRecordingManager>>());
+        std::thread::spawn(move || {
+            if let Err(e) = rm.preload_vad() {
+                debug!("VAD pre-load failed: {}", e);
+            }
+        });
+        debug!("start-path model_kickoff={:?}", started.elapsed());
+        load_started
+    }
 }
 
 impl StartSteps for AppStartSteps {
@@ -630,11 +650,13 @@ impl StartSteps for AppStartSteps {
         let tm = self.app.state::<Arc<TranscriptionManager>>();
         // Don't open the mic if nothing can transcribe the recording. A load
         // started by this start reports its own failure; one already running
-        // doesn't.
+        // doesn't. An accepted start kicks off its loads after the start
+        // sound, in `prepare_session`.
         if tm.is_model_loaded() {
             return true;
         }
         if self.selected_model.is_empty() {
+            self.kick_off_loads();
             warn!("Not starting recording: no model is selected");
             tm.raise_no_model_selected();
             return false;
@@ -644,8 +666,9 @@ impl StartSteps for AppStartSteps {
             .state::<Arc<ModelManager>>()
             .get_model_path(&self.selected_model)
         {
+            let load_started = self.kick_off_loads();
             warn!("Not starting recording: no model can transcribe it ({})", e);
-            if !self.load_started {
+            if !load_started {
                 tm.raise_model_load_failed(&self.selected_model, &e);
             }
             return false;
@@ -660,6 +683,7 @@ impl StartSteps for AppStartSteps {
     }
 
     fn prepare_session(&self) -> VadPolicy {
+        self.kick_off_loads();
         let app = &self.app;
         let tm = app.state::<Arc<TranscriptionManager>>();
         RECORDING_SESSION.fetch_add(1, Ordering::SeqCst);
@@ -667,7 +691,6 @@ impl StartSteps for AppStartSteps {
         set_tray_state(app, TrayIconState::Recording);
         let tray_elapsed = tray_started.elapsed();
 
-        // Get the microphone mode to determine audio feedback timing
         let plan_started = Instant::now();
         let settings = get_settings(app);
         let is_always_on = settings.always_on_microphone;
@@ -753,28 +776,11 @@ impl ShortcutAction for TranscribeAction {
         let start_time = Instant::now();
         debug!("TranscribeAction::start called for binding: {}", binding_id);
 
-        // Load model in the background
         let tm = app.state::<Arc<TranscriptionManager>>();
-        let rm = app.state::<Arc<AudioRecordingManager>>();
-
-        // Load ASR model and VAD model in parallel
-        let kickoff_started = Instant::now();
-        // An empty selection has nothing to load; `can_start` says so.
-        let selected_model = get_settings(app).selected_model;
-        let load_started = !selected_model.is_empty() && tm.initiate_model_load(true);
-        let rm_clone = Arc::clone(&rm);
-        std::thread::spawn(move || {
-            if let Err(e) = rm_clone.preload_vad() {
-                debug!("VAD pre-load failed: {}", e);
-            }
-        });
-        debug!("start-path model_kickoff={:?}", kickoff_started.elapsed());
-
         let steps = AppStartSteps {
             app: app.clone(),
             binding_id: binding_id.to_string(),
-            selected_model,
-            load_started,
+            selected_model: get_settings(app).selected_model,
         };
         match run_start(steps) {
             StartOutcome::Refused => return,
@@ -1551,6 +1557,8 @@ mod start_order_tests {
         }
 
         fn prepare_session(&self) -> VadPolicy {
+            // Gated too, so tray and overlay can't come before the sound.
+            pass(&self.0.mic_gate);
             VadPolicy::Disabled
         }
 
