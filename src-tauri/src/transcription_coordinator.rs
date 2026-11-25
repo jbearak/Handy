@@ -12,7 +12,15 @@ use tauri::{AppHandle, Manager};
 use tauri_specta::Event;
 
 const DEBOUNCE: Duration = Duration::from_millis(30);
-const RELEASE_GRACE: Duration = Duration::from_millis(50);
+/// How long a hold-mode key-up waits for an X11 auto-repeat press to cancel
+/// it (#1539). X11 fakes a release+press pair for a held key; macOS and
+/// Windows report auto-repeat as repeated key-downs, so there the release
+/// stops at once instead of holding every dictation's stop back.
+const RELEASE_GRACE: Duration = if cfg!(target_os = "linux") {
+    Duration::from_millis(50)
+} else {
+    Duration::ZERO
+};
 
 /// Recording phase events for windows that follow along (onboarding's Try it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -1843,7 +1851,7 @@ mod tests {
         assert!(state.on_processing_finished().is_none());
     }
 
-    /// The pipeline drains inside the 50ms grace of a busy tap: recording
+    /// The pipeline drains inside the release grace of a busy tap: recording
     /// starts first (unlocked, from the real key-down), and the grace then
     /// resolves against the live recording, locking it as the tap it was.
     #[test]
@@ -2173,5 +2181,51 @@ mod tests {
             state.on_input(chord, t0 + ms(20)),
             Some(Effect::Start { .. })
         ));
+    }
+
+    /// Mirrors the coordinator loop with a fake clock: while a release is
+    /// deferred, the loop sleeps in `recv_timeout` until the deadline and then
+    /// runs `on_grace_expired`. Returns when the Stop effect ran, if one did.
+    fn run_grace_timer(state: &mut CoordinatorState, clock: &mut Instant) -> Option<Instant> {
+        while let Some(deadline) = state.grace_deadline() {
+            *clock = (*clock).max(deadline);
+            if let Some(Effect::Stop { .. }) = state.on_grace_expired() {
+                return Some(*clock);
+            }
+        }
+        None
+    }
+
+    /// Time from a hold's key-up to the Stop effect, for push-to-talk and an
+    /// Auto (hold-or-toggle) hold past the threshold.
+    #[test]
+    fn hold_release_to_stop_latency() {
+        for mode in [
+            ShortcutActivation::PushToTalk,
+            ShortcutActivation::HoldOrToggle,
+        ] {
+            let mut state = CoordinatorState::new();
+            let t0 = Instant::now();
+            assert!(matches!(
+                state.on_input(press_at(mode, true, t0), t0),
+                Some(Effect::Start { .. })
+            ));
+            let released_at = t0 + ms(800);
+            let mut clock = released_at;
+            let stopped_at =
+                match state.on_input(press_at(mode, false, released_at), released_at) {
+                    Some(Effect::Stop { .. }) => Some(clock),
+                    _ => run_grace_timer(&mut state, &mut clock),
+                }
+                .expect("a hold release must stop recording");
+            let latency = stopped_at - released_at;
+            eprintln!("{mode:?}: hold release to Stop = {latency:?}");
+            assert_eq!(latency, RELEASE_GRACE);
+            #[cfg(target_os = "linux")]
+            assert_eq!(latency, ms(50), "X11 auto-repeat still needs the grace");
+            #[cfg(not(target_os = "linux"))]
+            assert_eq!(latency, Duration::ZERO, "nothing fakes a release here");
+            assert_eq!(state.stage, Stage::Processing);
+        }
     }
 }

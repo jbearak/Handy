@@ -30,7 +30,8 @@ const NO_WORDS_MS = 5000;
 
 /**
  * Slack past the hold threshold before calling it a hold: the coordinator's
- * 50ms release grace means a tap just under the threshold reports "locked" late.
+ * release grace (50ms on Linux) means a tap just under the threshold reports
+ * "locked" late.
  */
 const HOLD_MARGIN_MS = 150;
 
