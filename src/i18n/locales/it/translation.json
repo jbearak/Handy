@@ -392,7 +392,9 @@
       },
       "modifierAlone": {
         "label": "Usa solo {{modifiers}}",
-        "description": "Premi solo {{modifiers}} per dettare, come con la tua scorciatoia. Digitare o fare clic mentre lo tieni premuto annulla la registrazione."
+        "description": "Premi solo {{modifiers}} per dettare, come con la tua scorciatoia. Digitare o fare clic mentre lo tieni premuto annulla la registrazione.",
+        "behaviorTitle": "Comportamento di solo {{modifiers}}",
+        "behaviorDescription": "Scegli come solo {{modifiers}} avvia e interrompe la registrazione. La scorciatoia mantiene il proprio comportamento."
       }
     },
     "models": {

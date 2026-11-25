@@ -392,7 +392,9 @@
       },
       "modifierAlone": {
         "label": "Yalnızca {{modifiers}} Kullan",
-        "description": "Dikte etmek için kısayolunuzda olduğu gibi yalnızca {{modifiers}} tuşuna basın. Basılı tutarken yazmak veya tıklamak kaydı iptal eder."
+        "description": "Dikte etmek için kısayolunuzda olduğu gibi yalnızca {{modifiers}} tuşuna basın. Basılı tutarken yazmak veya tıklamak kaydı iptal eder.",
+        "behaviorTitle": "Yalnızca {{modifiers}} Davranışı",
+        "behaviorDescription": "Yalnızca {{modifiers}} tuşunun kaydı nasıl başlatıp durduracağını seçin. Kısayolunuz kendi davranışını korur."
       }
     },
     "models": {

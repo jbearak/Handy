@@ -392,7 +392,9 @@
       },
       "modifierAlone": {
         "label": "Utiliser {{modifiers}} seul",
-        "description": "Appuyez sur {{modifiers}} seul pour dicter, comme avec votre raccourci. Taper ou cliquer en la maintenant enfoncée annule l'enregistrement."
+        "description": "Appuyez sur {{modifiers}} seul pour dicter, comme avec votre raccourci. Taper ou cliquer en la maintenant enfoncée annule l'enregistrement.",
+        "behaviorTitle": "Comportement de {{modifiers}} seul",
+        "behaviorDescription": "Choisissez comment {{modifiers}} seul démarre et arrête l'enregistrement. Votre raccourci garde son propre comportement."
       }
     },
     "models": {

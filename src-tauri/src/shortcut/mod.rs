@@ -609,6 +609,18 @@ pub fn change_modifier_alone_trigger_setting(app: AppHandle, enabled: bool) -> R
 
 #[tauri::command]
 #[specta::specta]
+pub fn change_modifier_alone_activation_setting(
+    app: AppHandle,
+    activation: ShortcutActivation,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.modifier_alone_activation = activation;
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn change_hold_threshold_ms_setting(app: AppHandle, ms: u64) -> Result<(), String> {
     let mut settings = settings::get_settings(&app);
     settings.hold_threshold_ms = ms;

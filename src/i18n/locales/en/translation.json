@@ -392,7 +392,9 @@
       },
       "modifierAlone": {
         "label": "Use {{modifiers}} Alone",
-        "description": "Press {{modifiers}} by itself to dictate, just like your shortcut. Typing or clicking while holding it cancels the recording."
+        "description": "Press {{modifiers}} by itself to dictate, just like your shortcut. Typing or clicking while holding it cancels the recording.",
+        "behaviorTitle": "{{modifiers}} Alone Behavior",
+        "behaviorDescription": "Choose how {{modifiers}} alone starts and stops recording. Your shortcut keeps its own behavior."
       }
     },
     "models": {

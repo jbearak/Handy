@@ -392,7 +392,9 @@
       },
       "modifierAlone": {
         "label": "Použít samotný {{modifiers}}",
-        "description": "Stiskněte samotný {{modifiers}} a diktujte stejně jako zkratkou. Psaní nebo kliknutí, zatímco ho držíte, nahrávání zruší."
+        "description": "Stiskněte samotný {{modifiers}} a diktujte stejně jako zkratkou. Psaní nebo kliknutí, zatímco ho držíte, nahrávání zruší.",
+        "behaviorTitle": "Chování samotného {{modifiers}}",
+        "behaviorDescription": "Vyberte, jak samotný {{modifiers}} spouští a zastavuje nahrávání. Zkratka si ponechá vlastní chování."
       }
     },
     "models": {

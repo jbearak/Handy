@@ -1,6 +1,8 @@
 import React from "react";
 import { useTranslation } from "react-i18next";
 import { ToggleSwitch } from "../ui/ToggleSwitch";
+import { SettingContainer } from "../ui/SettingContainer";
+import { ActivationDropdown } from "./ShortcutActivation";
 import { useSettings } from "../../hooks/useSettings";
 import { useOsType } from "../../hooks/useOsType";
 import {
@@ -19,8 +21,9 @@ const isModifier = (key: string) =>
 
 /**
  * The transcribe shortcut's modifiers on their own (Option for Option+Space)
- * also dictate. Only handy-keys on macOS supports it, and only for a shortcut
- * that has both modifiers and a key.
+ * also dictate, with their own Auto / Hold / Toggle behavior. Only
+ * handy-keys on macOS supports it, and only for a shortcut that has both
+ * modifiers and a key.
  */
 export const ModifierAloneTrigger: React.FC<ModifierAloneTriggerProps> =
   React.memo(({ descriptionMode = "tooltip", grouped = false }) => {
@@ -42,17 +45,46 @@ export const ModifierAloneTrigger: React.FC<ModifierAloneTriggerProps> =
     }
     const label = formatKeyCombination(modifiers.join("+"), osType);
 
+    const enabled = getSetting("modifier_alone_trigger") ?? false;
+
     return (
-      <ToggleSwitch
-        checked={getSetting("modifier_alone_trigger") ?? false}
-        onChange={(enabled) => updateSetting("modifier_alone_trigger", enabled)}
-        isUpdating={isUpdating("modifier_alone_trigger")}
-        label={t("settings.general.modifierAlone.label", { modifiers: label })}
-        description={t("settings.general.modifierAlone.description", {
-          modifiers: label,
-        })}
-        descriptionMode={descriptionMode}
-        grouped={grouped}
-      />
+      <>
+        <ToggleSwitch
+          checked={enabled}
+          onChange={(value) => updateSetting("modifier_alone_trigger", value)}
+          isUpdating={isUpdating("modifier_alone_trigger")}
+          label={t("settings.general.modifierAlone.label", {
+            modifiers: label,
+          })}
+          description={t("settings.general.modifierAlone.description", {
+            modifiers: label,
+          })}
+          descriptionMode={descriptionMode}
+          grouped={grouped}
+        />
+        {enabled && (
+          <SettingContainer
+            title={t("settings.general.modifierAlone.behaviorTitle", {
+              modifiers: label,
+            })}
+            description={t(
+              "settings.general.modifierAlone.behaviorDescription",
+              { modifiers: label },
+            )}
+            descriptionMode={descriptionMode}
+            grouped={grouped}
+          >
+            <ActivationDropdown
+              selected={
+                getSetting("modifier_alone_activation") ?? "hold_or_toggle"
+              }
+              onSelect={(value) =>
+                updateSetting("modifier_alone_activation", value)
+              }
+              disabled={isUpdating("modifier_alone_activation")}
+            />
+          </SettingContainer>
+        )}
+      </>
     );
   });

@@ -392,7 +392,9 @@
       },
       "modifierAlone": {
         "label": "Brug kun {{modifiers}}",
-        "description": "Tryk på {{modifiers}} alene for at diktere, ligesom med din genvej. Skriver eller klikker du, mens du holder den nede, annulleres optagelsen."
+        "description": "Tryk på {{modifiers}} alene for at diktere, ligesom med din genvej. Skriver eller klikker du, mens du holder den nede, annulleres optagelsen.",
+        "behaviorTitle": "Adfærd for kun {{modifiers}}",
+        "behaviorDescription": "Vælg, hvordan {{modifiers}} alene starter og stopper optagelsen. Din genvej beholder sin egen adfærd."
       }
     },
     "models": {

@@ -392,7 +392,9 @@
       },
       "modifierAlone": {
         "label": "Fes servir només {{modifiers}}",
-        "description": "Prem només {{modifiers}} per dictar, igual que la drecera. Escriure o fer clic mentre el mantens premut cancel·la l'enregistrament."
+        "description": "Prem només {{modifiers}} per dictar, igual que la drecera. Escriure o fer clic mentre el mantens premut cancel·la l'enregistrament.",
+        "behaviorTitle": "Comportament de només {{modifiers}}",
+        "behaviorDescription": "Tria com només {{modifiers}} inicia i atura l'enregistrament. La drecera manté el seu propi comportament."
       }
     },
     "models": {

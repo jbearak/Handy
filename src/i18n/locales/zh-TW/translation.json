@@ -392,7 +392,9 @@
       },
       "modifierAlone": {
         "label": "單獨使用 {{modifiers}}",
-        "description": "單獨按下 {{modifiers}} 即可聽寫，與快捷鍵用法相同。按住時打字或點按會取消錄音。"
+        "description": "單獨按下 {{modifiers}} 即可聽寫，與快捷鍵用法相同。按住時打字或點按會取消錄音。",
+        "behaviorTitle": "單獨 {{modifiers}} 的行為",
+        "behaviorDescription": "選擇單獨按 {{modifiers}} 時如何開始與停止錄音。快捷鍵保留自己的行為。"
       }
     },
     "models": {

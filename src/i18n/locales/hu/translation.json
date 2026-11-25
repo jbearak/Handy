@@ -392,7 +392,9 @@
       },
       "modifierAlone": {
         "label": "Csak {{modifiers}} használata",
-        "description": "Nyomja meg csak a(z) {{modifiers}} billentyűt a diktáláshoz, akárcsak a billentyűparancsot. Ha lenyomva tartása közben gépel vagy kattint, a felvétel megszakad."
+        "description": "Nyomja meg csak a(z) {{modifiers}} billentyűt a diktáláshoz, akárcsak a billentyűparancsot. Ha lenyomva tartása közben gépel vagy kattint, a felvétel megszakad.",
+        "behaviorTitle": "Csak {{modifiers}} működése",
+        "behaviorDescription": "Válassza ki, hogyan indítja és állítja le a felvételt önmagában a(z) {{modifiers}}. A billentyűparancs megtartja a saját működését."
       }
     },
     "models": {

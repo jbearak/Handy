@@ -392,7 +392,9 @@
       },
       "modifierAlone": {
         "label": "单独使用 {{modifiers}}",
-        "description": "单独按下 {{modifiers}} 即可听写，与快捷键用法相同。按住时打字或点击会取消录音。"
+        "description": "单独按下 {{modifiers}} 即可听写，与快捷键用法相同。按住时打字或点击会取消录音。",
+        "behaviorTitle": "单独 {{modifiers}} 的行为",
+        "behaviorDescription": "选择单独按 {{modifiers}} 时如何开始和停止录音。快捷键保留自己的行为。"
       }
     },
     "models": {

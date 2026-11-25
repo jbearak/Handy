@@ -171,15 +171,18 @@ fn apply_trigger_action(app: &AppHandle, hotkey_string: &str, action: TriggerAct
                 TRANSCRIBE,
                 hotkey_string,
                 pressed,
-                settings.shortcut_activation,
+                settings.modifier_alone_activation,
                 std::time::Duration::from_millis(settings.hold_threshold_ms),
                 at,
             );
         }
         TriggerAction::Discard { pressed_at } => coordinator.discard_press(TRANSCRIBE, pressed_at),
-        TriggerAction::Rebase { pressed_at, at } => {
-            coordinator.rebase_press(TRANSCRIBE, pressed_at, at)
-        }
+        TriggerAction::Rebase { pressed_at, at } => coordinator.rebase_press(
+            TRANSCRIBE,
+            pressed_at,
+            at,
+            get_settings(app).shortcut_activation,
+        ),
         TriggerAction::Chord { .. } => {}
     }
 }

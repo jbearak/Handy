@@ -392,7 +392,9 @@
       },
       "modifierAlone": {
         "label": "Använd bara {{modifiers}}",
-        "description": "Tryck på {{modifiers}} ensam för att diktera, precis som med ditt kortkommando. Skriver eller klickar du medan du håller ned den avbryts inspelningen."
+        "description": "Tryck på {{modifiers}} ensam för att diktera, precis som med ditt kortkommando. Skriver eller klickar du medan du håller ned den avbryts inspelningen.",
+        "behaviorTitle": "Beteende för bara {{modifiers}}",
+        "behaviorDescription": "Välj hur {{modifiers}} ensam startar och stoppar inspelningen. Ditt kortkommando behåller sitt eget beteende."
       }
     },
     "models": {

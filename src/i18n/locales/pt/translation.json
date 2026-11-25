@@ -392,7 +392,9 @@
       },
       "modifierAlone": {
         "label": "Usar apenas {{modifiers}}",
-        "description": "Pressione apenas {{modifiers}} para ditar, como com o seu atalho. Digitar ou clicar enquanto a mantém pressionada cancela a gravação."
+        "description": "Pressione apenas {{modifiers}} para ditar, como com o seu atalho. Digitar ou clicar enquanto a mantém pressionada cancela a gravação.",
+        "behaviorTitle": "Comportamento de apenas {{modifiers}}",
+        "behaviorDescription": "Escolha como apenas {{modifiers}} inicia e para a gravação. O seu atalho mantém o próprio comportamento."
       }
     },
     "models": {
