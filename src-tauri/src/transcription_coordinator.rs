@@ -227,6 +227,7 @@ enum Command {
         binding_id: String,
         pressed_at: Instant,
         at: Instant,
+        chord_mode: ShortcutActivation,
     },
 }
 
@@ -594,23 +595,32 @@ impl CoordinatorState {
 
     /// Another press of the same binding took over the press at `pressed_at`
     /// before its key came up (Option, then Space for `option+space`): time
-    /// tap vs hold from `at`, as if the session had started there.
-    fn on_rebase(&mut self, binding_id: &str, pressed_at: Instant, at: Instant) {
+    /// tap vs hold from `at`, as if the session had started there, and follow
+    /// `chord_mode` from now on. Option alone can have its own mode, so a
+    /// session it started may be locked (Toggle) when the chord isn't, or the
+    /// other way round. The press hasn't come up yet, so nothing but its
+    /// starting mode can have locked it.
+    fn on_rebase(
+        &mut self,
+        binding_id: &str,
+        pressed_at: Instant,
+        at: Instant,
+        chord_mode: ShortcutActivation,
+    ) {
+        let locked = chord_mode == ShortcutActivation::Toggle;
         if let Some(pending) = self
             .pending_press
             .as_mut()
-            .filter(|p| p.binding_id == binding_id && p.pressed_at == pressed_at && !p.locked)
+            .filter(|p| p.binding_id == binding_id && p.pressed_at == pressed_at)
         {
             pending.pressed_at = at;
+            pending.locked = locked;
             return;
         }
         if matches!(&self.stage, Stage::Recording(id) if id == binding_id) {
-            if let Some(hold) = self
-                .hold
-                .as_mut()
-                .filter(|h| h.pressed_at == pressed_at && !h.locked)
-            {
+            if let Some(hold) = self.hold.as_mut().filter(|h| h.pressed_at == pressed_at) {
                 hold.pressed_at = at;
+                hold.locked = locked;
             }
         }
     }
@@ -763,7 +773,8 @@ impl TranscriptionCoordinator {
                             binding_id,
                             pressed_at,
                             at,
-                        } => state.on_rebase(&binding_id, pressed_at, at),
+                            chord_mode,
+                        } => state.on_rebase(&binding_id, pressed_at, at, chord_mode),
                     }
                     if !was_locked && state.is_recording_locked() {
                         emit_recording_phase(&app, RecordingPhase::Locked);
@@ -848,12 +859,20 @@ impl TranscriptionCoordinator {
         });
     }
 
-    /// Measure the hold of the press sent at `pressed_at` from `at`.
-    pub fn rebase_press(&self, binding_id: &str, pressed_at: Instant, at: Instant) {
+    /// Measure the hold of the press sent at `pressed_at` from `at`, and
+    /// treat it as a press of the chord, in `chord_mode`.
+    pub fn rebase_press(
+        &self,
+        binding_id: &str,
+        pressed_at: Instant,
+        at: Instant,
+        chord_mode: ShortcutActivation,
+    ) {
         self.send_command(Command::Rebase {
             binding_id: binding_id.to_string(),
             pressed_at,
             at,
+            chord_mode,
         });
     }
 
@@ -1995,24 +2014,29 @@ mod tests {
         let mut state = CoordinatorState::new();
         let t0 = Instant::now();
         state.on_input(press_at(mode, true, t0), t0);
-        state.on_rebase(BINDING, t0, t0 + ms(400));
+        state.on_rebase(BINDING, t0, t0 + ms(400), mode);
         state.on_input(press_at(mode, false, t0 + ms(500)), t0 + ms(500));
         assert!(state.on_grace_expired().is_none());
         assert!(state.is_recording_locked());
     }
 
     #[test]
-    fn rebase_never_touches_another_press_or_a_locked_session() {
+    fn rebase_never_touches_another_press() {
         let mode = ShortcutActivation::HoldOrToggle;
         let mut state = CoordinatorState::new();
         let t0 = Instant::now();
         state.on_input(press_at(mode, true, t0), t0);
-        state.on_rebase(BINDING, t0 - ms(1), t0 + ms(400));
+        state.on_rebase(BINDING, t0 - ms(1), t0 + ms(400), mode);
         assert_eq!(state.hold.as_ref().unwrap().pressed_at, t0);
 
+        // A session a tap locked stays locked when a later press, the one
+        // that stops it, is taken over by the chord.
         let mut state = CoordinatorState::new();
-        state.on_input(press_at(ShortcutActivation::Toggle, true, t0), t0);
-        state.on_rebase(BINDING, t0, t0 + ms(400));
+        state.on_input(press_at(mode, true, t0), t0);
+        state.on_input(press_at(mode, false, t0 + ms(100)), t0 + ms(100));
+        assert!(state.on_grace_expired().is_none());
+        state.on_rebase(BINDING, t0 + ms(900), t0 + ms(950), mode);
+        assert!(state.is_recording_locked());
         assert_eq!(state.hold.as_ref().unwrap().pressed_at, t0);
     }
 
@@ -2024,7 +2048,7 @@ mod tests {
         drive_into_processing(&mut state, t0);
         let pressed = t0 + ms(500);
         state.on_input(press_at(mode, true, pressed), pressed);
-        state.on_rebase(BINDING, pressed, pressed + ms(400));
+        state.on_rebase(BINDING, pressed, pressed + ms(400), mode);
         assert_eq!(
             state.pending_press.as_ref().unwrap().pressed_at,
             pressed + ms(400)
@@ -2068,6 +2092,71 @@ mod tests {
             state.on_input(trigger_at(true, again), again),
             Some(Effect::Stop { .. })
         ));
+    }
+
+    /// Option alone is Auto, Option+Space is Toggle. Option goes down first,
+    /// so each Option+Space starts as a bare press that the chord takes over;
+    /// the manager's own chord press is absorbed.
+    fn bare_press_then_chord(
+        state: &mut CoordinatorState,
+        chord_mode: ShortcutActivation,
+        t: Instant,
+    ) -> Option<Effect> {
+        let effect = state.on_input(trigger_at(true, t), t);
+        state.on_rebase(BINDING, t, t + ms(40), chord_mode);
+        effect
+    }
+
+    #[test]
+    fn toggle_chord_over_an_auto_bare_press_toggles() {
+        let toggle = ShortcutActivation::Toggle;
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        assert!(matches!(
+            bare_press_then_chord(&mut state, toggle, t0),
+            Some(Effect::Start { .. })
+        ));
+        // Held well past the threshold: Toggle still ignores the release.
+        let up = t0 + ms(900);
+        assert!(state.on_input(press_at(toggle, false, up), up).is_none());
+        assert!(state.on_grace_expired().is_none());
+        assert!(state.is_recording_locked());
+        // The next Option+Space stops it.
+        let again = t0 + ms(3000);
+        assert!(matches!(
+            bare_press_then_chord(&mut state, toggle, again),
+            Some(Effect::Stop { .. })
+        ));
+    }
+
+    #[test]
+    fn auto_chord_over_a_toggle_bare_press_can_be_held() {
+        // The reverse: Option alone toggles, Option+Space is Auto. Holding
+        // Option+Space must still stop on release.
+        let auto = ShortcutActivation::HoldOrToggle;
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        let mut bare = press_at(ShortcutActivation::Toggle, true, t0);
+        bare.distinct = true;
+        state.on_input(bare, t0);
+        state.on_rebase(BINDING, t0, t0 + ms(40), auto);
+        assert!(!state.is_locked());
+        let up = t0 + ms(900);
+        assert!(state.on_input(press_at(auto, false, up), up).is_none());
+        assert!(matches!(
+            state.on_grace_expired(),
+            Some(Effect::Stop { .. })
+        ));
+    }
+
+    #[test]
+    fn toggle_chord_locks_a_press_remembered_while_busy() {
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        drive_into_processing(&mut state, t0);
+        let pressed = t0 + ms(500);
+        bare_press_then_chord(&mut state, ShortcutActivation::Toggle, pressed);
+        assert!(state.pending_press.as_ref().unwrap().locked);
     }
 
     #[test]

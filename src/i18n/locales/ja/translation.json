@@ -392,7 +392,9 @@
       },
       "modifierAlone": {
         "label": "{{modifiers}} だけで使う",
-        "description": "ショートカットと同じように、{{modifiers}} だけを押して音声入力できます。押したまま入力やクリックをすると録音は取り消されます。"
+        "description": "ショートカットと同じように、{{modifiers}} だけを押して音声入力できます。押したまま入力やクリックをすると録音は取り消されます。",
+        "behaviorTitle": "{{modifiers}} だけの動作",
+        "behaviorDescription": "{{modifiers}} だけで録音を開始・停止する方法を選びます。ショートカットの動作は変わりません。"
       }
     },
     "models": {

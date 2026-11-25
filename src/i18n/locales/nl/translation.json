@@ -392,7 +392,9 @@
       },
       "modifierAlone": {
         "label": "Alleen {{modifiers}} gebruiken",
-        "description": "Druk alleen op {{modifiers}} om te dicteren, net als met je sneltoets. Typen of klikken terwijl je hem ingedrukt houdt, annuleert de opname."
+        "description": "Druk alleen op {{modifiers}} om te dicteren, net als met je sneltoets. Typen of klikken terwijl je hem ingedrukt houdt, annuleert de opname.",
+        "behaviorTitle": "Gedrag van alleen {{modifiers}}",
+        "behaviorDescription": "Kies hoe alleen {{modifiers}} de opname start en stopt. Je sneltoets houdt zijn eigen gedrag."
       }
     },
     "models": {

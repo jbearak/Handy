@@ -423,6 +423,11 @@ pub struct AppSettings {
     /// `option+space`) also start dictation. handy-keys on macOS only.
     #[serde(default)]
     pub modifier_alone_trigger: bool,
+    /// How the modifiers alone start and stop recording, apart from the
+    /// shortcut's own `shortcut_activation` (Option+Space can toggle while
+    /// Option alone is hold-or-toggle).
+    #[serde(default)]
+    pub modifier_alone_activation: ShortcutActivation,
     #[serde(default)]
     pub audio_feedback: bool,
     #[serde(default = "default_audio_feedback_volume")]
@@ -1022,6 +1027,7 @@ pub fn get_default_settings() -> AppSettings {
         shortcut_activation: ShortcutActivation::default(),
         hold_threshold_ms: default_hold_threshold_ms(),
         modifier_alone_trigger: false,
+        modifier_alone_activation: ShortcutActivation::default(),
         audio_feedback: false,
         audio_feedback_volume: default_audio_feedback_volume(),
         sound_theme: default_sound_theme(),
@@ -1564,6 +1570,10 @@ mod tests {
         assert_eq!(settings.hold_threshold_ms, default_hold_threshold_ms());
         // Opt-in: stores from before the setting keep only their shortcut.
         assert!(!settings.modifier_alone_trigger);
+        assert_eq!(
+            settings.modifier_alone_activation,
+            ShortcutActivation::HoldOrToggle
+        );
         assert!(!settings.audio_feedback);
         assert!(settings.filler_word_removal_enabled);
         // Bindings default to empty; the load path merges the real defaults in.

@@ -392,7 +392,9 @@
       },
       "modifierAlone": {
         "label": "Chỉ dùng {{modifiers}}",
-        "description": "Chỉ nhấn {{modifiers}} để đọc chính tả, giống như phím tắt của bạn. Gõ phím hoặc nhấp chuột khi đang giữ phím sẽ hủy bản ghi."
+        "description": "Chỉ nhấn {{modifiers}} để đọc chính tả, giống như phím tắt của bạn. Gõ phím hoặc nhấp chuột khi đang giữ phím sẽ hủy bản ghi.",
+        "behaviorTitle": "Hành vi khi chỉ dùng {{modifiers}}",
+        "behaviorDescription": "Chọn cách chỉ {{modifiers}} bắt đầu và dừng ghi âm. Phím tắt của bạn vẫn giữ hành vi riêng."
       }
     },
     "models": {

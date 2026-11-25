@@ -392,7 +392,9 @@
       },
       "modifierAlone": {
         "label": "Nur {{modifiers}} verwenden",
-        "description": "Drücke {{modifiers}} allein, um zu diktieren, genau wie mit deinem Tastenkürzel. Tippen oder Klicken, während du sie hältst, bricht die Aufnahme ab."
+        "description": "Drücke {{modifiers}} allein, um zu diktieren, genau wie mit deinem Tastenkürzel. Tippen oder Klicken, während du sie hältst, bricht die Aufnahme ab.",
+        "behaviorTitle": "Verhalten von {{modifiers}} allein",
+        "behaviorDescription": "Wähle, wie {{modifiers}} allein die Aufnahme startet und stoppt. Dein Tastenkürzel behält sein eigenes Verhalten."
       }
     },
     "models": {

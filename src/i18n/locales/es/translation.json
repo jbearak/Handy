@@ -392,7 +392,9 @@
       },
       "modifierAlone": {
         "label": "Usar solo {{modifiers}}",
-        "description": "Pulsa solo {{modifiers}} para dictar, igual que con tu atajo. Escribir o hacer clic mientras la mantienes pulsada cancela la grabación."
+        "description": "Pulsa solo {{modifiers}} para dictar, igual que con tu atajo. Escribir o hacer clic mientras la mantienes pulsada cancela la grabación.",
+        "behaviorTitle": "Comportamiento de solo {{modifiers}}",
+        "behaviorDescription": "Elige cómo solo {{modifiers}} inicia y detiene la grabación. Tu atajo mantiene su propio comportamiento."
       }
     },
     "models": {

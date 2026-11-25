@@ -392,7 +392,9 @@
       },
       "modifierAlone": {
         "label": "Używaj samego {{modifiers}}",
-        "description": "Naciśnij sam klawisz {{modifiers}}, aby dyktować, tak jak skrótem. Pisanie lub klikanie, gdy go przytrzymujesz, anuluje nagrywanie."
+        "description": "Naciśnij sam klawisz {{modifiers}}, aby dyktować, tak jak skrótem. Pisanie lub klikanie, gdy go przytrzymujesz, anuluje nagrywanie.",
+        "behaviorTitle": "Zachowanie samego {{modifiers}}",
+        "behaviorDescription": "Wybierz, jak sam klawisz {{modifiers}} rozpoczyna i kończy nagrywanie. Skrót zachowuje własne zachowanie."
       }
     },
     "models": {

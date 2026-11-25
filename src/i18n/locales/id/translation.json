@@ -392,7 +392,9 @@
       },
       "modifierAlone": {
         "label": "Gunakan {{modifiers}} Saja",
-        "description": "Tekan {{modifiers}} saja untuk mendikte, sama seperti pintasan Anda. Mengetik atau mengeklik sambil menahannya akan membatalkan rekaman."
+        "description": "Tekan {{modifiers}} saja untuk mendikte, sama seperti pintasan Anda. Mengetik atau mengeklik sambil menahannya akan membatalkan rekaman.",
+        "behaviorTitle": "Perilaku {{modifiers}} Saja",
+        "behaviorDescription": "Pilih cara {{modifiers}} saja memulai dan menghentikan rekaman. Pintasan Anda tetap memakai perilakunya sendiri."
       }
     },
     "models": {
