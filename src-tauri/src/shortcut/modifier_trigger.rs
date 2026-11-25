@@ -70,9 +70,17 @@ pub struct ModifierTrigger {
     /// Whether the trigger modifiers were held at the last modifier event.
     held: bool,
     /// The raw stream already showed the chord's key and handed the press
-    /// over, so the hotkey manager's report of that chord press is a duplicate.
-    absorb_chord_press: bool,
+    /// over, so the hotkey manager's report of that chord press, due before
+    /// this deadline, is a duplicate. A deadline rather than "until the next
+    /// hold": a stalled poll can drain a whole later hold before the
+    /// manager's report, and a report that never comes must not eat a later
+    /// chord.
+    absorb_chord_press: Option<Instant>,
 }
+
+/// How long the manager's report of a chord press the raw stream already
+/// handled can lag behind it.
+const ABSORB_WINDOW: Duration = Duration::from_secs(1);
 
 impl ModifierTrigger {
     /// A trigger for `chord`'s modifiers, or `None` when the binding has no
@@ -91,7 +99,7 @@ impl ModifierTrigger {
             hold_threshold,
             state: State::Idle,
             held: false,
-            absorb_chord_press: false,
+            absorb_chord_press: None,
         })
     }
 
@@ -143,7 +151,7 @@ impl ModifierTrigger {
         match self.state {
             State::Pressed { at } if is_chord => {
                 self.state = State::Chorded;
-                self.absorb_chord_press = true;
+                self.absorb_chord_press = Some(now + ABSORB_WINDOW);
                 Some(TriggerAction::Rebase {
                     pressed_at: at,
                     at: now,
@@ -168,9 +176,6 @@ impl ModifierTrigger {
         self.held = held;
         match self.state {
             State::Idle if went_down => {
-                // A fresh hold: a chord press the raw stream saw but the
-                // manager never reported must not eat the next one.
-                self.absorb_chord_press = false;
                 // Only the trigger's own down edge with nothing else held
                 // counts: Shift then Option is a chord, and so is releasing
                 // Shift from Shift+Option.
@@ -203,9 +208,12 @@ impl ModifierTrigger {
 
     /// The binding's chord (from the hotkey manager) went down or up.
     pub fn on_chord(&mut self, pressed: bool, now: Instant) -> Option<TriggerAction> {
-        if pressed && self.absorb_chord_press {
-            self.absorb_chord_press = false;
-            return None;
+        if pressed {
+            if let Some(deadline) = self.absorb_chord_press.take() {
+                if now <= deadline {
+                    return None;
+                }
+            }
         }
         // The chord came up after the modifiers did: nothing of this hold is
         // left to absorb.
@@ -516,6 +524,32 @@ mod tests {
         assert_eq!(
             t.on_chord(true, ms(t0, 2000)),
             Some(TriggerAction::Chord { pressed: true })
+        );
+    }
+
+    #[test]
+    fn a_stalled_poll_keeps_the_late_chord_report_off_the_next_hold() {
+        // The manager loop stalled: the raw queue holds a whole Option+Space
+        // hold and the next Option press before the manager's chord press.
+        let mut t = trigger();
+        let t0 = Instant::now();
+        t.on_key_event(&mods(OPT, true), t0, true);
+        t.on_key_event(&key(OPT, Key::Space, true), ms(t0, 100), true);
+        t.on_key_event(&mods(Modifiers::empty(), false), ms(t0, 150), true);
+        assert_eq!(
+            t.on_key_event(&mods(OPT, true), ms(t0, 250), true),
+            Some(TriggerAction::Press { at: ms(t0, 250) })
+        );
+        // The first hold's chord edges arrive late: absorbed and passed on,
+        // leaving the second hold pressed.
+        assert_eq!(t.on_chord(true, ms(t0, 260)), None);
+        assert_eq!(
+            t.on_chord(false, ms(t0, 261)),
+            Some(TriggerAction::Chord { pressed: false })
+        );
+        assert_eq!(
+            t.on_key_event(&mods(Modifiers::empty(), false), ms(t0, 400), true),
+            Some(TriggerAction::Release { at: ms(t0, 400) })
         );
     }
 
