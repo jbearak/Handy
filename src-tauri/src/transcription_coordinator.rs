@@ -12,7 +12,15 @@ use tauri::{AppHandle, Manager};
 use tauri_specta::Event;
 
 const DEBOUNCE: Duration = Duration::from_millis(30);
-const RELEASE_GRACE: Duration = Duration::from_millis(50);
+/// How long a hold-mode key-up waits for an X11 auto-repeat press to cancel
+/// it (#1539). X11 fakes a release+press pair for a held key; macOS and
+/// Windows report auto-repeat as repeated key-downs, so there the release
+/// stops at once instead of holding every dictation's stop back.
+const RELEASE_GRACE: Duration = if cfg!(target_os = "linux") {
+    Duration::from_millis(50)
+} else {
+    Duration::ZERO
+};
 
 /// Recording phase events for windows that follow along (onboarding's Try it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -1843,7 +1851,7 @@ mod tests {
         assert!(state.on_processing_finished().is_none());
     }
 
-    /// The pipeline drains inside the 50ms grace of a busy tap: recording
+    /// The pipeline drains inside the release grace of a busy tap: recording
     /// starts first (unlocked, from the real key-down), and the grace then
     /// resolves against the live recording, locking it as the tap it was.
     #[test]
@@ -2213,6 +2221,10 @@ mod tests {
             let latency = stopped_at - released_at;
             eprintln!("{mode:?}: hold release to Stop = {latency:?}");
             assert_eq!(latency, RELEASE_GRACE);
+            #[cfg(target_os = "linux")]
+            assert_eq!(latency, ms(50), "X11 auto-repeat still needs the grace");
+            #[cfg(not(target_os = "linux"))]
+            assert_eq!(latency, Duration::ZERO, "nothing fakes a release here");
             assert_eq!(state.stage, Stage::Processing);
         }
     }
