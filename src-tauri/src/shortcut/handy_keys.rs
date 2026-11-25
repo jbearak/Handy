@@ -105,6 +105,31 @@ impl ModifierTriggerRuntime {
         })
     }
 
+    /// Tear the trigger down, releasing a press still held.
+    fn stop(mut self, app: &AppHandle) {
+        if let Some(action) = self.machine.abandon(std::time::Instant::now()) {
+            apply_trigger_action(app, &self.hotkey_string, action);
+        }
+    }
+
+    /// Replace `current` with the trigger the settings now ask for. A change
+    /// of hold threshold alone keeps the running trigger and its listener.
+    fn rebuild(current: &mut Option<Self>, app: &AppHandle, hotkey_string: Option<&str>) {
+        let settings = get_settings(app);
+        if let Some(trigger) = current.as_mut().filter(|t| {
+            settings.modifier_alone_trigger && Some(t.hotkey_string.as_str()) == hotkey_string
+        }) {
+            trigger
+                .machine
+                .set_hold_threshold(std::time::Duration::from_millis(settings.hold_threshold_ms));
+            return;
+        }
+        if let Some(old) = current.take() {
+            old.stop(app);
+        }
+        *current = hotkey_string.and_then(|hotkey| Self::build(app, hotkey));
+    }
+
     /// Feed the listener's queued events to the machine.
     fn drain(&mut self, app: &AppHandle) {
         while let Some(event) = self.listener.try_recv() {
@@ -132,10 +157,15 @@ fn apply_trigger_action(app: &AppHandle, hotkey_string: &str, action: TriggerAct
     match action {
         TriggerAction::Press { at } | TriggerAction::Release { at } => {
             let settings = get_settings(app);
-            coordinator.send_input_at(
+            // Every Option keystroke would raise "no model selected".
+            let pressed = matches!(action, TriggerAction::Press { .. });
+            if pressed && settings.selected_model.is_empty() {
+                return;
+            }
+            coordinator.send_trigger_input(
                 TRANSCRIBE,
                 hotkey_string,
-                matches!(action, TriggerAction::Press { .. }),
+                pressed,
                 settings.shortcut_activation,
                 std::time::Duration::from_millis(settings.hold_threshold_ms),
                 at,
@@ -260,7 +290,11 @@ impl HandyKeysState {
                             &hotkey_string,
                         );
                         if result.is_ok() && binding_id == TRANSCRIBE {
-                            modifier_trigger = ModifierTriggerRuntime::build(&app, &hotkey_string);
+                            ModifierTriggerRuntime::rebuild(
+                                &mut modifier_trigger,
+                                &app,
+                                Some(&hotkey_string),
+                            );
                         }
                         let _ = response.send(result);
                     }
@@ -277,7 +311,7 @@ impl HandyKeysState {
                         if binding_id == TRANSCRIBE {
                             // Also while capturing a new shortcut: pressing
                             // Option then must not start dictation.
-                            modifier_trigger = None;
+                            ModifierTriggerRuntime::rebuild(&mut modifier_trigger, &app, None);
                         }
                         let _ = response.send(result);
                     }
@@ -286,8 +320,11 @@ impl HandyKeysState {
                             .values()
                             .find(|(id, _)| id == TRANSCRIBE)
                             .map(|(_, hotkey)| hotkey.clone());
-                        modifier_trigger = transcribe
-                            .and_then(|hotkey| ModifierTriggerRuntime::build(&app, &hotkey));
+                        ModifierTriggerRuntime::rebuild(
+                            &mut modifier_trigger,
+                            &app,
+                            transcribe.as_deref(),
+                        );
                     }
                     ManagerCommand::Shutdown => {
                         info!("handy-keys manager thread shutting down");

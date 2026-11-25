@@ -69,6 +69,9 @@ pub struct ModifierTrigger {
     state: State,
     /// Whether the trigger modifiers were held at the last modifier event.
     held: bool,
+    /// The raw stream already showed the chord's key and handed the press
+    /// over, so the hotkey manager's report of that chord press is a duplicate.
+    absorb_chord_press: bool,
 }
 
 impl ModifierTrigger {
@@ -88,7 +91,21 @@ impl ModifierTrigger {
             hold_threshold,
             state: State::Idle,
             held: false,
+            absorb_chord_press: false,
         })
+    }
+
+    /// Measure extra modifiers against a new hold threshold.
+    pub fn set_hold_threshold(&mut self, hold_threshold: Duration) {
+        self.hold_threshold = hold_threshold;
+    }
+
+    /// The trigger is going away: release a press still held, or its release
+    /// would never reach the coordinator.
+    pub fn abandon(&mut self, now: Instant) -> Option<TriggerAction> {
+        let pressed = matches!(self.state, State::Pressed { .. });
+        self.state = State::Idle;
+        pressed.then_some(TriggerAction::Release { at: now })
     }
 
     /// Exactly the trigger modifiers are held.
@@ -119,11 +136,20 @@ impl ModifierTrigger {
         if !event.is_key_down || !self.covered(event.modifiers) {
             return None;
         }
-        // The chord's own key is the chord, reported by the hotkey manager
-        // (before or after this event), not typing.
+        // The chord's own key is the chord, not typing. It takes the press
+        // over here, in the raw stream's order: the hotkey manager reports it
+        // on its own queue, possibly after this hold's modifier release.
         let is_chord = Some(key) == self.chord.key && self.alone(event.modifiers);
         match self.state {
-            State::Pressed { at } if !is_chord => {
+            State::Pressed { at } if is_chord => {
+                self.state = State::Chorded;
+                self.absorb_chord_press = true;
+                Some(TriggerAction::Rebase {
+                    pressed_at: at,
+                    at: now,
+                })
+            }
+            State::Pressed { at } => {
                 self.state = State::Dirty;
                 Some(TriggerAction::Discard { pressed_at: at })
             }
@@ -142,6 +168,9 @@ impl ModifierTrigger {
         self.held = held;
         match self.state {
             State::Idle if went_down => {
+                // A fresh hold: a chord press the raw stream saw but the
+                // manager never reported must not eat the next one.
+                self.absorb_chord_press = false;
                 // Only the trigger's own down edge with nothing else held
                 // counts: Shift then Option is a chord, and so is releasing
                 // Shift from Shift+Option.
@@ -174,6 +203,15 @@ impl ModifierTrigger {
 
     /// The binding's chord (from the hotkey manager) went down or up.
     pub fn on_chord(&mut self, pressed: bool, now: Instant) -> Option<TriggerAction> {
+        if pressed && self.absorb_chord_press {
+            self.absorb_chord_press = false;
+            return None;
+        }
+        // The chord came up after the modifiers did: nothing of this hold is
+        // left to absorb.
+        if !pressed && self.state == State::Chorded && !self.held {
+            self.state = State::Idle;
+        }
         match self.state {
             State::Pressed { at } if pressed => {
                 self.state = State::Chorded;
@@ -379,25 +417,25 @@ mod tests {
 
     #[test]
     fn chord_takes_over_and_absorbs_the_option_release() {
-        // Option down, then Space: one session, timed from Space. The raw
-        // Space key-down arriving first or not at all changes nothing.
+        // Option down, then Space: one session, timed from Space, whichever
+        // stream reports Space first (or only the hotkey manager).
         for raw_space in [true, false] {
             let mut t = trigger();
             let t0 = Instant::now();
             t.on_key_event(&mods(OPT, true), t0, true);
+            let rebase = Some(TriggerAction::Rebase {
+                pressed_at: t0,
+                at: ms(t0, 400),
+            });
             if raw_space {
                 assert_eq!(
                     t.on_key_event(&key(OPT, Key::Space, true), ms(t0, 400), true),
-                    None
+                    rebase
                 );
+                assert_eq!(t.on_chord(true, ms(t0, 401)), None);
+            } else {
+                assert_eq!(t.on_chord(true, ms(t0, 400)), rebase);
             }
-            assert_eq!(
-                t.on_chord(true, ms(t0, 401)),
-                Some(TriggerAction::Rebase {
-                    pressed_at: t0,
-                    at: ms(t0, 401)
-                })
-            );
             assert_eq!(
                 t.on_chord(false, ms(t0, 480)),
                 Some(TriggerAction::Chord { pressed: false })
@@ -406,7 +444,93 @@ mod tests {
                 t.on_key_event(&mods(Modifiers::empty(), false), ms(t0, 600), true),
                 None
             );
+            assert_eq!(
+                t.on_key_event(&mods(OPT, true), ms(t0, 900), true),
+                Some(TriggerAction::Press { at: ms(t0, 900) })
+            );
         }
+    }
+
+    #[test]
+    fn option_up_drained_before_the_managers_chord_press() {
+        // Space down and Option up land in one poll: the raw queue holds both
+        // before the manager's chord press is read. The Space key-down hands
+        // the press over first, so the Option release ends nothing.
+        let mut t = trigger();
+        let t0 = Instant::now();
+        t.on_key_event(&mods(OPT, true), t0, true);
+        assert!(matches!(
+            t.on_key_event(&key(OPT, Key::Space, true), ms(t0, 500), true),
+            Some(TriggerAction::Rebase { .. })
+        ));
+        assert_eq!(
+            t.on_key_event(&mods(Modifiers::empty(), false), ms(t0, 505), true),
+            None
+        );
+        assert_eq!(t.on_chord(true, ms(t0, 506)), None);
+        assert_eq!(
+            t.on_chord(false, ms(t0, 560)),
+            Some(TriggerAction::Chord { pressed: false })
+        );
+        assert_eq!(
+            t.on_key_event(&mods(OPT, true), ms(t0, 900), true),
+            Some(TriggerAction::Press { at: ms(t0, 900) })
+        );
+    }
+
+    #[test]
+    fn chord_reported_after_option_up_never_strands_the_next_press() {
+        // The raw stream never showed Space (another tap swallowed it), so
+        // Option up released the bare press before the chord's events came.
+        let mut t = trigger();
+        let t0 = Instant::now();
+        t.on_key_event(&mods(OPT, true), t0, true);
+        assert!(matches!(
+            t.on_key_event(&mods(Modifiers::empty(), false), ms(t0, 500), true),
+            Some(TriggerAction::Release { .. })
+        ));
+        assert_eq!(
+            t.on_chord(true, ms(t0, 501)),
+            Some(TriggerAction::Chord { pressed: true })
+        );
+        assert_eq!(
+            t.on_chord(false, ms(t0, 550)),
+            Some(TriggerAction::Chord { pressed: false })
+        );
+        assert_eq!(
+            t.on_key_event(&mods(OPT, true), ms(t0, 900), true),
+            Some(TriggerAction::Press { at: ms(t0, 900) })
+        );
+    }
+
+    #[test]
+    fn a_stale_absorb_never_eats_a_later_chord() {
+        // The manager never reported the chord the raw stream saw.
+        let mut t = trigger();
+        let t0 = Instant::now();
+        t.on_key_event(&mods(OPT, true), t0, true);
+        t.on_key_event(&key(OPT, Key::Space, true), ms(t0, 100), true);
+        t.on_key_event(&mods(Modifiers::empty(), false), ms(t0, 200), true);
+        t.on_key_event(&mods(OPT, true), ms(t0, 900), true);
+        t.on_key_event(&mods(Modifiers::empty(), false), ms(t0, 1000), true);
+        assert_eq!(
+            t.on_chord(true, ms(t0, 2000)),
+            Some(TriggerAction::Chord { pressed: true })
+        );
+    }
+
+    #[test]
+    fn abandon_releases_a_held_press_only() {
+        let mut t = trigger();
+        let t0 = Instant::now();
+        assert_eq!(t.abandon(t0), None);
+        t.on_key_event(&mods(OPT, true), t0, true);
+        assert_eq!(
+            t.abandon(ms(t0, 50)),
+            Some(TriggerAction::Release { at: ms(t0, 50) })
+        );
+        t.on_key_event(&key(OPT, Key::E, true), ms(t0, 60), true);
+        assert_eq!(t.abandon(ms(t0, 70)), None);
     }
 
     #[test]

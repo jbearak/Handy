@@ -168,6 +168,10 @@ struct InputEvent {
     /// They fire on every edge by design and must never be debounced —
     /// dropping one desyncs toggle parity and wedges recording on.
     external: bool,
+    /// Each press is a distinct physical press, never auto-repeat: the
+    /// modifier-alone trigger reports real modifier edges. A press during a
+    /// deferred release first lets that release take effect.
+    distinct: bool,
     /// When the sender observed the edge, not when the coordinator thread
     /// dequeues it. The coordinator executes `Effect::Start` inline, and the
     /// first activation after startup spends hundreds of milliseconds
@@ -305,6 +309,27 @@ impl CoordinatorState {
     }
 
     fn on_input(&mut self, input: InputEvent, now: Instant) -> Option<Effect> {
+        // A distinct press can't be the auto-repeat the release grace waits
+        // for: resolve the deferred release first, so a quick re-press can't
+        // swallow it and leave the earlier session running. If that stops
+        // recording, the press then meets a busy pipeline and yields nothing.
+        let resolved = if input.distinct
+            && input.is_pressed
+            && self
+                .pending_release
+                .as_ref()
+                .is_some_and(|p| p.binding_id == input.binding_id)
+        {
+            self.on_grace_expired()
+        } else {
+            None
+        };
+        let effect = self.on_edge(input, now);
+        debug_assert!(resolved.is_none() || effect.is_none());
+        resolved.or(effect)
+    }
+
+    fn on_edge(&mut self, input: InputEvent, now: Instant) -> Option<Effect> {
         let pending_release_binding = self
             .pending_release
             .as_ref()
@@ -545,6 +570,11 @@ impl CoordinatorState {
             self.drop_pending_release(binding_id);
             return false;
         }
+        // A discarded press must not debounce the chord that follows it
+        // (Option, Shift, Space within 30ms for option+shift+space).
+        if self.last_press == Some(pressed_at) {
+            self.last_press = None;
+        }
         let started_it = matches!(&self.stage, Stage::Recording(id) if id == binding_id)
             && self
                 .hold
@@ -759,19 +789,21 @@ impl TranscriptionCoordinator {
         mode: ShortcutActivation,
         hold_threshold: Duration,
     ) {
-        self.send_input_at(
-            binding_id,
-            hotkey_string,
+        self.send_command(Command::Input(InputEvent {
+            binding_id: binding_id.to_string(),
+            hotkey_string: hotkey_string.to_string(),
             is_pressed,
             mode,
             hold_threshold,
-            Instant::now(),
-        );
+            external: false,
+            distinct: false,
+            received_at: Instant::now(),
+        }));
     }
 
-    /// [`Self::send_input`] for an edge observed at `at`. A later
+    /// An edge of the modifier-alone trigger, observed at `at`. A later
     /// [`Self::discard_press`] or [`Self::rebase_press`] names the press by it.
-    pub fn send_input_at(
+    pub fn send_trigger_input(
         &self,
         binding_id: &str,
         hotkey_string: &str,
@@ -787,6 +819,7 @@ impl TranscriptionCoordinator {
             mode,
             hold_threshold,
             external: false,
+            distinct: true,
             received_at: at,
         }));
     }
@@ -801,6 +834,7 @@ impl TranscriptionCoordinator {
             mode: ShortcutActivation::Toggle,
             hold_threshold: Duration::ZERO,
             external: true,
+            distinct: false,
             received_at: Instant::now(),
         }));
     }
@@ -1082,6 +1116,7 @@ mod tests {
             mode: ShortcutActivation::PushToTalk,
             hold_threshold: Duration::ZERO,
             external: false,
+            distinct: false,
             received_at: Instant::now(),
         }
     }
@@ -1221,6 +1256,7 @@ mod tests {
                     mode: ShortcutActivation::Toggle,
                     hold_threshold: Duration::ZERO,
                     external: true,
+                    distinct: false,
                     received_at: at,
                 },
                 at,
@@ -1284,6 +1320,7 @@ mod tests {
             mode: ShortcutActivation::Toggle,
             hold_threshold: Duration::ZERO,
             external,
+            distinct: false,
             received_at: Instant::now(),
         }
     }
@@ -1410,6 +1447,7 @@ mod tests {
             mode,
             hold_threshold: HOLD_THRESHOLD,
             external: false,
+            distinct: false,
             received_at: Instant::now(),
         }
     }
@@ -1990,5 +2028,60 @@ mod tests {
             state.pending_press.as_ref().unwrap().pressed_at,
             pressed + ms(400)
         );
+    }
+
+    fn trigger_at(is_pressed: bool, at: Instant) -> InputEvent {
+        let mut event = press_at(ShortcutActivation::HoldOrToggle, is_pressed, at);
+        event.distinct = true;
+        event
+    }
+
+    #[test]
+    fn quick_bare_repress_resolves_the_deferred_release_first() {
+        // A long Option hold, then Option up and down again within the
+        // release grace to type Option+E: the first session must stop, and
+        // the second press is the one the discard names.
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        state.on_input(trigger_at(true, t0), t0);
+        state.on_input(trigger_at(false, t0 + ms(800)), t0 + ms(800));
+        let again = t0 + ms(820);
+        assert!(matches!(
+            state.on_input(trigger_at(true, again), again),
+            Some(Effect::Stop { .. })
+        ));
+        assert_eq!(state.stage, Stage::Processing);
+        assert!(state.pending_press.is_some());
+        assert!(!state.on_discard(BINDING, again));
+        assert!(state.on_processing_finished().is_none());
+    }
+
+    #[test]
+    fn quick_bare_repress_after_a_tap_stops_the_locked_session() {
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        state.on_input(trigger_at(true, t0), t0);
+        state.on_input(trigger_at(false, t0 + ms(100)), t0 + ms(100));
+        let again = t0 + ms(120);
+        assert!(matches!(
+            state.on_input(trigger_at(true, again), again),
+            Some(Effect::Stop { .. })
+        ));
+    }
+
+    #[test]
+    fn discard_clears_the_debounce_its_press_set() {
+        let mode = ShortcutActivation::HoldOrToggle;
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        state.on_input(trigger_at(true, t0), t0);
+        assert!(state.on_discard(BINDING, t0));
+        // option+shift+space lands 20ms after Option down.
+        let mut chord = press_at(mode, true, t0 + ms(20));
+        chord.binding_id = "transcribe_with_post_process".to_string();
+        assert!(matches!(
+            state.on_input(chord, t0 + ms(20)),
+            Some(Effect::Start { .. })
+        ));
     }
 }
