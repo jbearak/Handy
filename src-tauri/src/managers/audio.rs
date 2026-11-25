@@ -15,6 +15,7 @@ use handy_recorder::{Channels, EndReason, ErrorKind, Recorder, RecorderConfig, S
 use log::{debug, error, info, trace, warn};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
 
@@ -448,6 +449,59 @@ fn open_microphone_on_channel(
     }
 }
 
+/// Closes the device on its own thread after `delay`, unless a recording
+/// starts first (it bumps `close_generation`) or one is running. A start
+/// racing the close either reuses the still-open stream, and the close is
+/// skipped, or waits on `device` for the close to finish and reopens.
+fn close_when_idle<D: Send + 'static>(
+    state: Arc<Mutex<RecordingState>>,
+    close_generation: Arc<AtomicU64>,
+    device: Arc<Mutex<D>>,
+    delay: Duration,
+    close: impl FnOnce(&mut D) + Send + 'static,
+) -> JoinHandle<()> {
+    let generation = close_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        // Check under both locks, in try_start_recording's order, so neither a
+        // start nor a switch to always-on can take the stream being closed.
+        // Then let go of `state`: the main thread takes it to cancel, and
+        // should not wait for the device teardown. (It still can behind a
+        // start that is waiting for this close, as it does behind any open.)
+        let state = state.lock().unwrap();
+        let mut device = device.lock().unwrap();
+        if close_generation.load(Ordering::SeqCst) != generation
+            || !matches!(*state, RecordingState::Idle)
+        {
+            return;
+        }
+        drop(state);
+        if !delay.is_zero() {
+            info!("Closing idle microphone stream after {delay:?}");
+        }
+        close(&mut device);
+    })
+}
+
+/// Closes the on-demand microphone once a recording has ended: after
+/// `STREAM_IDLE_TIMEOUT` with lazy close on, right away otherwise. Either
+/// way off the caller's thread, so the samples go to transcription without
+/// waiting for the device teardown.
+fn release_microphone<D: Send + 'static>(
+    state: Arc<Mutex<RecordingState>>,
+    close_generation: Arc<AtomicU64>,
+    device: Arc<Mutex<D>>,
+    lazy: bool,
+    close: impl FnOnce(&mut D) + Send + 'static,
+) -> JoinHandle<()> {
+    let delay = if lazy {
+        STREAM_IDLE_TIMEOUT
+    } else {
+        Duration::ZERO
+    };
+    close_when_idle(state, close_generation, device, delay, close)
+}
+
 /* ──────────────────────────────────────────────────────────────── */
 
 /// One recording session's first-sample notification. Waiting on this never
@@ -679,28 +733,36 @@ impl AudioRecordingManager {
         );
     }
 
-    fn schedule_lazy_close(&self) {
-        let gen = self.close_generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let app = self.app_handle.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(STREAM_IDLE_TIMEOUT);
-            let rm = app.state::<Arc<AudioRecordingManager>>();
-            // Hold state lock across the check AND close to serialize against
-            // try_start_recording, preventing a race where the stream is closed
-            // under an active recording.
-            let state = rm.state.lock().unwrap();
-            if rm.close_generation.load(Ordering::SeqCst) == gen
-                && matches!(*state, RecordingState::Idle)
-            {
-                // stop_microphone_stream does not acquire the state lock,
-                // so holding it here is safe (no deadlock).
-                info!(
-                    "Closing idle microphone stream after {:?}",
-                    STREAM_IDLE_TIMEOUT
-                );
-                rm.stop_microphone_stream();
-            }
-        });
+    /// In on-demand mode, closes the microphone after a recording ends.
+    fn release_microphone_after_recording(&self) {
+        if !matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand) {
+            return;
+        }
+        if !get_settings(&self.app_handle).lazy_stream_close {
+            // Unmute now, as closing did before it moved off this thread: a
+            // start that reuses the stream must not inherit our mute. (The
+            // stop action has already done this; a cancel hasn't.)
+            self.remove_mute();
+        }
+        self.close_microphone_when_idle();
+    }
+
+    /// In on-demand mode, schedules the microphone's close. A settings change
+    /// that reopens a warm stream calls this too: reopening cancelled the
+    /// close a recording had scheduled, and the stream must not stay open.
+    fn close_microphone_when_idle(&self) {
+        if !matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand) {
+            return;
+        }
+        let lazy = get_settings(&self.app_handle).lazy_stream_close;
+        let rm = self.clone();
+        release_microphone(
+            Arc::clone(&self.state),
+            Arc::clone(&self.close_generation),
+            Arc::clone(&self.is_open),
+            lazy,
+            move |open_flag| rm.close_stream(open_flag),
+        );
     }
 
     /* ---------- VAD --------------------------------------------------------- */
@@ -919,7 +981,12 @@ impl AudioRecordingManager {
     }
 
     pub fn stop_microphone_stream(&self) {
-        let mut open_flag = self.is_open.lock().unwrap();
+        self.close_stream(&mut self.is_open.lock().unwrap());
+    }
+
+    /// The body of `stop_microphone_stream`, for a caller already holding
+    /// `is_open`.
+    fn close_stream(&self, open_flag: &mut bool) {
         if !*open_flag {
             return;
         }
@@ -1044,8 +1111,8 @@ impl AudioRecordingManager {
             return Err(anyhow::anyhow!("Already recording"));
         }
 
-        // Cancel any pending lazy close (no-op in always-on mode, where
-        // closes are never scheduled).
+        // Cancel any pending close (no-op in always-on mode, where closes
+        // are never scheduled).
         self.close_generation.fetch_add(1, Ordering::SeqCst);
 
         // A recorder can fail just before this start, ahead of its failure
@@ -1136,6 +1203,8 @@ impl AudioRecordingManager {
                         "Failed to restore microphone stream after VAD backend change failed: {rollback_error}"
                     );
                 }
+                drop(state);
+                self.close_microphone_when_idle();
                 return Err(anyhow::anyhow!(
                     "Failed to reopen microphone with {:?} VAD: {change_error}",
                     backend
@@ -1145,6 +1214,9 @@ impl AudioRecordingManager {
 
         info!("VAD backend changed to {:?}", backend);
         drop(state);
+        if was_open {
+            self.close_microphone_when_idle();
+        }
         Ok(())
     }
 
@@ -1156,6 +1228,7 @@ impl AudioRecordingManager {
             self.close_generation.fetch_add(1, Ordering::SeqCst);
             self.stop_microphone_stream();
             self.start_microphone_stream()?;
+            self.close_microphone_when_idle();
         }
         Ok(())
     }
@@ -1190,6 +1263,9 @@ impl AudioRecordingManager {
             }
         }
         drop(state);
+        if was_open {
+            self.close_microphone_when_idle();
+        }
         Ok(())
     }
 
@@ -1215,6 +1291,9 @@ impl AudioRecordingManager {
             }
         }
         drop(state);
+        if was_open {
+            self.close_microphone_when_idle();
+        }
         Ok(())
     }
 
@@ -1286,14 +1365,7 @@ impl AudioRecordingManager {
                 *self.is_recording.lock().unwrap() = false;
                 self.set_state(&mut self.state.lock().unwrap(), RecordingState::Idle);
 
-                // In on-demand mode, close the mic (lazily if the setting is enabled)
-                if matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand) {
-                    if get_settings(&self.app_handle).lazy_stream_close {
-                        self.schedule_lazy_close();
-                    } else {
-                        self.stop_microphone_stream();
-                    }
-                }
+                self.release_microphone_after_recording();
 
                 if self.was_cancelled_since(cancel_generation) {
                     debug!("Recording stop cancelled; discarding captured samples");
@@ -1340,14 +1412,7 @@ impl AudioRecordingManager {
 
                 *self.is_recording.lock().unwrap() = false;
 
-                // In on-demand mode, close the mic (lazily if the setting is enabled)
-                if matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand) {
-                    if get_settings(&self.app_handle).lazy_stream_close {
-                        self.schedule_lazy_close();
-                    } else {
-                        self.stop_microphone_stream();
-                    }
-                }
+                self.release_microphone_after_recording();
             }
             RecordingState::Stopping => {
                 debug!("Cancellation requested while recording is stopping");
@@ -1414,5 +1479,261 @@ mod tests {
     fn microphone_config_takes_the_headset_only_in_airpods_mode() {
         assert!(!microphone_config(None, None, false, 480).take_headset);
         assert!(microphone_config(None, None, true, 480).take_headset);
+    }
+
+    /* ---------- closing the on-demand microphone ---------------------------- */
+
+    use handy_recorder::testing::FakeMic;
+    use handy_recorder::CollectingSink;
+    use std::thread;
+
+    type FakeRecorder = Recorder<CollectingSink>;
+
+    /// The manager's recording state, generation and device slot around
+    /// handy-recorder's fake microphone. `start` and `collect` follow
+    /// `try_start_recording` and `stop_recording`; the close after a
+    /// recording is the production `release_microphone`.
+    #[derive(Clone)]
+    struct Session {
+        mic: FakeMic,
+        state: Arc<Mutex<RecordingState>>,
+        close_generation: Arc<AtomicU64>,
+        device: Arc<Mutex<Option<FakeRecorder>>>,
+        _device_clock: Arc<DeviceClock>,
+    }
+
+    /// Calls the running stream back with silence every 2 ms, like a live
+    /// device; the recorder takes a stream whose callback stops for 0.5 s
+    /// as stalled. Stops with the last `Session` clone.
+    struct DeviceClock(Arc<AtomicBool>);
+
+    impl DeviceClock {
+        fn start(mic: FakeMic) -> Self {
+            let stopped = Arc::new(AtomicBool::new(false));
+            let stop = Arc::clone(&stopped);
+            thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    mic.push(&[0.0; 32]);
+                    thread::sleep(Duration::from_millis(2));
+                }
+            });
+            Self(stopped)
+        }
+    }
+
+    impl Drop for DeviceClock {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    impl Session {
+        fn new() -> Self {
+            let mic = FakeMic::new(16_000, 1);
+            Self {
+                _device_clock: Arc::new(DeviceClock::start(mic.clone())),
+                mic,
+                state: Arc::new(Mutex::new(RecordingState::Idle)),
+                close_generation: Arc::new(AtomicU64::new(0)),
+                device: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        /// Like `try_start_recording`, by a caller already holding `state`:
+        /// cancel a pending close, then reuse the open stream or open one.
+        fn start_locked(&self, state: &mut RecordingState) {
+            assert!(matches!(state, RecordingState::Idle));
+            self.close_generation.fetch_add(1, Ordering::SeqCst);
+            let mut device = self.device.lock().unwrap();
+            if device.is_none() {
+                let recorder = self
+                    .mic
+                    .open(RecorderConfig::speech(), None, Duration::from_secs(10))
+                    .unwrap();
+                *device = Some(recorder);
+            }
+            device
+                .as_ref()
+                .unwrap()
+                .start(CollectingSink::new())
+                .unwrap();
+            *state = RecordingState::Recording {
+                binding_id: "test".into(),
+            };
+        }
+
+        fn start(&self) {
+            self.start_locked(&mut self.state.lock().unwrap());
+        }
+
+        /// Like `stop_recording` up to the close: the samples, and Idle.
+        fn collect(&self) -> Vec<f32> {
+            *self.state.lock().unwrap() = RecordingState::Stopping;
+            let stopped = self.device.lock().unwrap().as_ref().unwrap().stop();
+            *self.state.lock().unwrap() = RecordingState::Idle;
+            stopped.unwrap().sink.into_samples()
+        }
+
+        fn release(&self) -> JoinHandle<()> {
+            self.release_costing(Duration::ZERO)
+        }
+
+        /// `release`, with a device that takes `cost` to close.
+        fn release_costing(&self, cost: Duration) -> JoinHandle<()> {
+            release_microphone(
+                Arc::clone(&self.state),
+                Arc::clone(&self.close_generation),
+                Arc::clone(&self.device),
+                false,
+                move |device: &mut Option<FakeRecorder>| {
+                    thread::sleep(cost);
+                    if let Some(recorder) = device.take() {
+                        recorder.close().unwrap();
+                    }
+                },
+            )
+        }
+
+        /// `stop_recording`: the samples, and the pending close.
+        fn stop(&self) -> (Vec<f32>, JoinHandle<()>) {
+            let samples = self.collect();
+            (samples, self.release())
+        }
+
+        /// Audio into the running stream.
+        fn speak(&self) {
+            assert!(self.mic.push(&[0.1; 4800]));
+        }
+
+        /// Waits until the close thread holds the device, i.e. is closing.
+        fn wait_for_close_to_start(&self) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while self.device.try_lock().is_ok() {
+                assert!(Instant::now() < deadline, "the close never started");
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn is_open(&self) -> bool {
+            self.device.lock().unwrap().is_some() && self.mic.is_streaming()
+        }
+    }
+
+    /// Runs `stop` on its own thread; the result, if it returns in time.
+    fn stop_within(session: &Session, limit: Duration) -> Option<(Vec<f32>, JoinHandle<()>)> {
+        let (tx, rx) = mpsc::channel();
+        let session = session.clone();
+        thread::spawn(move || {
+            let _ = tx.send(session.stop());
+        });
+        rx.recv_timeout(limit).ok()
+    }
+
+    #[test]
+    fn stop_returns_the_samples_before_a_slow_close_and_the_mic_then_closes() {
+        let session = Session::new();
+        session.start();
+        session.speak();
+        let teardown = session.mic.hang_teardown();
+
+        let stopped = stop_within(&session, Duration::from_secs(2));
+        let Some((samples, close)) = stopped else {
+            teardown.release();
+            panic!("stop waited for the microphone to close");
+        };
+        assert!(!samples.is_empty());
+        // The close holds `state` only to check it, not across the teardown,
+        // so a cancel on the main thread doesn't wait for the device.
+        session.wait_for_close_to_start();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while session.state.try_lock().is_err() {
+            if Instant::now() > deadline {
+                teardown.release();
+                panic!("the close held `state` across the teardown");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        teardown.release();
+        close.join().unwrap();
+        assert!(!session.is_open());
+    }
+
+    #[test]
+    fn a_start_before_the_close_reuses_the_stream_and_its_own_stop_closes_it() {
+        let session = Session::new();
+        session.start();
+        session.speak();
+        let samples = session.collect();
+        assert!(!samples.is_empty());
+
+        // The next press takes `state` before the close thread can.
+        let mut state = session.state.lock().unwrap();
+        let skipped = session.release();
+        session.start_locked(&mut state);
+        drop(state);
+        skipped.join().unwrap();
+        assert!(session.is_open(), "the close ran under a new recording");
+
+        session.speak();
+        let (samples, close) = session.stop();
+        assert!(!samples.is_empty());
+        close.join().unwrap();
+        assert!(!session.is_open());
+    }
+
+    #[test]
+    fn a_start_during_the_close_waits_for_it_and_reopens() {
+        let session = Session::new();
+        session.start();
+        let teardown = session.mic.hang_teardown();
+        let Some((_, close)) = stop_within(&session, Duration::from_secs(2)) else {
+            teardown.release();
+            panic!("stop waited for the microphone to close");
+        };
+
+        session.wait_for_close_to_start();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let starter = session.clone();
+        thread::spawn(move || {
+            starter.start();
+            let _ = started_tx.send(());
+        });
+        assert!(
+            started_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "a start used the stream being closed"
+        );
+
+        teardown.release();
+        close.join().unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(session.is_open());
+
+        session.speak();
+        let (samples, close) = session.stop();
+        assert!(!samples.is_empty());
+        close.join().unwrap();
+        assert!(!session.is_open());
+    }
+
+    /// The BEFORE/AFTER number: stop to samples returned, with a device that
+    /// takes `CLOSE_COST` to close. Run with `--nocapture` to see it.
+    #[test]
+    fn stop_latency_with_a_slow_close() {
+        const CLOSE_COST: Duration = Duration::from_millis(200);
+        let session = Session::new();
+        session.start();
+        session.speak();
+
+        let started = Instant::now();
+        let samples = session.collect();
+        let close = session.release_costing(CLOSE_COST);
+        let elapsed = started.elapsed();
+        println!("stop returned the samples in {elapsed:?} with a {CLOSE_COST:?} close");
+        assert!(!samples.is_empty());
+
+        close.join().unwrap();
+        assert!(!session.is_open());
     }
 }
