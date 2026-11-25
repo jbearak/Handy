@@ -748,12 +748,6 @@ impl AudioRecordingManager {
         if !matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand) {
             return;
         }
-        if !get_settings(&self.app_handle).lazy_stream_close {
-            // Unmute now, as closing did before it moved off this thread: a
-            // start that reuses the stream must not inherit our mute. (The
-            // stop action has already done this; a cancel hasn't.)
-            self.remove_mute();
-        }
         self.close_microphone_when_idle();
     }
 
@@ -1425,6 +1419,9 @@ impl AudioRecordingManager {
 
                 *self.is_recording.lock().unwrap() = false;
 
+                // The stop action unmutes for a stop; a cancel does it here,
+                // in every microphone mode.
+                self.remove_mute();
                 self.release_microphone_after_recording();
             }
             RecordingState::Stopping => {
