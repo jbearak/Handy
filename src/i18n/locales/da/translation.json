@@ -775,7 +775,8 @@
       },
       "soundTheme": {
         "label": "Lydtema",
-        "description": "Vælg et lydtema til feedback ved start og stop af optagelse"
+        "description": "Vælg et lydtema til feedback ved start og stop af optagelse",
+        "hex": "Hex"
       },
       "wordCorrectionThreshold": {
         "title": "Tærskel for ordkorrektion",

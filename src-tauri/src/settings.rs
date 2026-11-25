@@ -289,6 +289,9 @@ impl ModelUnloadTimeout {
 pub enum SoundTheme {
     Marimba,
     Pop,
+    // Hex's start and stop sounds (its "Classic" set); see
+    // `resources/HEX_SOUNDS_LICENSE.txt`.
+    Hex,
     Custom,
 }
 
@@ -297,6 +300,7 @@ impl SoundTheme {
         match self {
             SoundTheme::Marimba => "marimba",
             SoundTheme::Pop => "pop",
+            SoundTheme::Hex => "hex",
             SoundTheme::Custom => "custom",
         }
     }

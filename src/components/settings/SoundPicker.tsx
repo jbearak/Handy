@@ -1,10 +1,12 @@
 import React, { useEffect } from "react";
+import { useTranslation } from "react-i18next";
 import { Button } from "../ui/Button";
 import { Dropdown, DropdownOption } from "../ui/Dropdown";
 import { PlayIcon } from "lucide-react";
 import { SettingContainer } from "../ui/SettingContainer";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useSettings } from "../../hooks/useSettings";
+import type { SoundTheme } from "@/bindings";
 
 interface SoundPickerProps {
   label: string;
@@ -15,6 +17,7 @@ export const SoundPicker: React.FC<SoundPickerProps> = ({
   label,
   description,
 }) => {
+  const { t } = useTranslation();
   const { getSetting, updateSetting } = useSettings();
   const playTestSound = useSettingsStore((state) => state.playTestSound);
   const customSounds = useSettingsStore((state) => state.customSounds);
@@ -31,6 +34,7 @@ export const SoundPicker: React.FC<SoundPickerProps> = ({
   const options: DropdownOption[] = [
     { value: "marimba", label: "Marimba" },
     { value: "pop", label: "Pop" },
+    { value: "hex", label: t("settings.debug.soundTheme.hex") },
   ];
 
   // Only add Custom option if both custom sound files exist
@@ -54,7 +58,7 @@ export const SoundPicker: React.FC<SoundPickerProps> = ({
         <Dropdown
           selectedValue={selectedTheme}
           onSelect={(value) =>
-            updateSetting("sound_theme", value as "marimba" | "pop" | "custom")
+            updateSetting("sound_theme", value as SoundTheme)
           }
           options={options}
           onOpen={checkCustomSounds}

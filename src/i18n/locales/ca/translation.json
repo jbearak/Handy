@@ -775,7 +775,8 @@
       },
       "soundTheme": {
         "label": "Tema de so",
-        "description": "Trieu un tema de so per als avisos d'inici i d'aturada de l'enregistrament"
+        "description": "Trieu un tema de so per als avisos d'inici i d'aturada de l'enregistrament",
+        "hex": "Hex"
       },
       "wordCorrectionThreshold": {
         "title": "Llindar de correcció de paraules",

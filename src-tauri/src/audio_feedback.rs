@@ -139,3 +139,38 @@ fn play_audio_file(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rodio::Source;
+
+    /// Every bundled theme's start and stop file decodes with the decoder that
+    /// plays it and holds sound.
+    #[test]
+    fn bundled_theme_sounds_decode() {
+        let resources = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for theme in [SoundTheme::Marimba, SoundTheme::Pop, SoundTheme::Hex] {
+            for path in [theme.to_start_path(), theme.to_stop_path()] {
+                let file = File::open(resources.join(&path))
+                    .unwrap_or_else(|e| panic!("{path} should be bundled: {e}"));
+                let decoder = rodio::Decoder::new(BufReader::new(file))
+                    .unwrap_or_else(|e| panic!("{path} should decode: {e}"));
+                assert!(decoder.sample_rate().get() > 0, "{path}");
+                assert!(decoder.count() > 0, "{path} should hold samples");
+            }
+        }
+    }
+
+    #[test]
+    fn hex_theme_round_trips_and_uses_its_resources() {
+        let json = serde_json::to_string(&SoundTheme::Hex).unwrap();
+        assert_eq!(json, "\"hex\"");
+        assert_eq!(
+            serde_json::from_str::<SoundTheme>(&json).unwrap(),
+            SoundTheme::Hex
+        );
+        assert_eq!(SoundTheme::Hex.to_start_path(), "resources/hex_start.wav");
+        assert_eq!(SoundTheme::Hex.to_stop_path(), "resources/hex_stop.wav");
+    }
+}

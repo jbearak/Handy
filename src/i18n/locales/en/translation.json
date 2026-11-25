@@ -775,7 +775,8 @@
       },
       "soundTheme": {
         "label": "Sound Theme",
-        "description": "Choose a sound theme for recording start and stop feedback"
+        "description": "Choose a sound theme for recording start and stop feedback",
+        "hex": "Hex"
       },
       "wordCorrectionThreshold": {
         "title": "Word Correction Threshold",

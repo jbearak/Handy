@@ -775,7 +775,8 @@
       },
       "soundTheme": {
         "label": "Ses Teması",
-        "description": "Kayıt başlangıç ve bitişi için sesli geri bildirim temasını seçin"
+        "description": "Kayıt başlangıç ve bitişi için sesli geri bildirim temasını seçin",
+        "hex": "Hex"
       },
       "wordCorrectionThreshold": {
         "title": "Kelime Düzeltme Eşiği",
