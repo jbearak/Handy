@@ -1203,6 +1203,8 @@ impl AudioRecordingManager {
                         "Failed to restore microphone stream after VAD backend change failed: {rollback_error}"
                     );
                 }
+                drop(state);
+                self.close_microphone_when_idle();
                 return Err(anyhow::anyhow!(
                     "Failed to reopen microphone with {:?} VAD: {change_error}",
                     backend
