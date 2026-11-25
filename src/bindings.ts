@@ -29,14 +29,6 @@ async changeShortcutActivationSetting(activation: ShortcutActivation) : Promise<
     else return { status: "error", error: e  as any };
 }
 },
-async changeModifierAloneActivationSetting(activation: ShortcutActivation) : Promise<Result<null, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("change_modifier_alone_activation_setting", { activation }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
 async changeHoldThresholdMsSetting(ms: number) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("change_hold_threshold_ms_setting", { ms }) };
@@ -48,6 +40,14 @@ async changeHoldThresholdMsSetting(ms: number) : Promise<Result<null, string>> {
 async changeModifierAloneTriggerSetting(enabled: boolean) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("change_modifier_alone_trigger_setting", { enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async changeModifierAloneActivationSetting(activation: ShortcutActivation) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_modifier_alone_activation_setting", { activation }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
