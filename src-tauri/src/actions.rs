@@ -533,7 +533,9 @@ pub(crate) trait StartSteps: Clone + Send + 'static {
     fn emit_ready(&self);
     /// Plays the start sound to its end; returns at once when feedback is off.
     fn play_start_sound(&self);
-    fn apply_mute(&self);
+    /// Mutes system audio for the capture `generation`, unless it has been
+    /// stopped or cancelled since.
+    fn apply_mute(&self, generation: u64);
 }
 
 pub(crate) enum StartOutcome {
@@ -555,10 +557,16 @@ pub(crate) fn run_start<S: StartSteps>(steps: S) -> StartOutcome {
     // the mic-ready cue. Its own thread opens the feedback output if needed.
     // A microphone already in a session refuses the start below, so that
     // press gets no sound.
-    let start_sound = (!steps.is_recording()).then(|| {
-        let steps = steps.clone();
-        std::thread::spawn(move || steps.play_start_sound())
-    });
+    let start_sound = (!steps.is_recording())
+        .then(|| {
+            let steps = steps.clone();
+            std::thread::Builder::new()
+                .name("start-sound".into())
+                .spawn(move || steps.play_start_sound())
+                .map_err(|e| warn!("Failed to spawn the start sound thread: {e}"))
+                .ok()
+        })
+        .flatten();
     let vad_policy = steps.prepare_session();
 
     let recording_start_time = Instant::now();
@@ -609,9 +617,7 @@ pub(crate) fn run_start<S: StartSteps>(steps: S) -> StartOutcome {
         if let Some(start_sound) = start_sound {
             let _ = start_sound.join();
         }
-        if steps.is_current(generation) {
-            steps.apply_mute();
-        }
+        steps.apply_mute(generation);
     }))
 }
 
@@ -766,8 +772,10 @@ impl StartSteps for AppStartSteps {
         play_feedback_sound_blocking(&self.app, SoundType::Start);
     }
 
-    fn apply_mute(&self) {
-        self.app.state::<Arc<AudioRecordingManager>>().apply_mute();
+    fn apply_mute(&self, generation: u64) {
+        self.app
+            .state::<Arc<AudioRecordingManager>>()
+            .apply_mute(generation);
     }
 }
 
@@ -1421,6 +1429,7 @@ mod start_order_tests {
     use super::{run_start, StartOutcome, StartSteps};
     use crate::audio_toolkit::VadPolicy;
     use crate::managers::audio::RecordingReadiness;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -1449,16 +1458,17 @@ mod start_order_tests {
         Fails,
     }
 
-    /// Stands in for the app: a microphone whose open waits on a gate and
-    /// costs `mic_cost`, and whose first audio comes when the test sends it.
+    /// Stands in for the app: a microphone whose open waits on a gate, and
+    /// whose first audio comes when the test sends it.
     struct Fake {
         can_start: bool,
         mic: Mic,
-        mic_cost: Duration,
+        /// Set once the session is stopped or cancelled.
+        stopped: AtomicBool,
         mic_gate: Mutex<Option<Receiver<()>>>,
         first_audio: Mutex<Option<Receiver<()>>>,
         tone_gate: Mutex<Option<Receiver<()>>>,
-        log: Mutex<Vec<(Step, Instant)>>,
+        log: Mutex<Vec<Step>>,
         events: Mutex<Sender<Step>>,
     }
 
@@ -1489,7 +1499,7 @@ mod start_order_tests {
         }
     }
 
-    fn fake(can_start: bool, mic: Mic, mic_cost: Duration) -> (FakeSteps, Controls) {
+    fn fake(can_start: bool, mic: Mic) -> (FakeSteps, Controls) {
         let (mic_tx, mic_rx) = mpsc::channel();
         let (audio_tx, audio_rx) = mpsc::channel();
         let (tone_tx, tone_rx) = mpsc::channel();
@@ -1497,7 +1507,7 @@ mod start_order_tests {
         let steps = FakeSteps(Arc::new(Fake {
             can_start,
             mic,
-            mic_cost,
+            stopped: AtomicBool::new(false),
             mic_gate: Mutex::new(Some(mic_rx)),
             first_audio: Mutex::new(Some(audio_rx)),
             tone_gate: Mutex::new(Some(tone_rx)),
@@ -1515,28 +1525,24 @@ mod start_order_tests {
 
     impl FakeSteps {
         fn record(&self, step: Step) {
-            self.0.log.lock().unwrap().push((step, Instant::now()));
+            self.0.log.lock().unwrap().push(step);
             let _ = self.0.events.lock().unwrap().send(step);
         }
 
-        fn log(&self) -> Vec<(Step, Instant)> {
-            self.0.log.lock().unwrap().clone()
-        }
-
         fn steps(&self) -> Vec<Step> {
-            self.log().into_iter().map(|(s, _)| s).collect()
+            self.0.log.lock().unwrap().clone()
         }
 
         fn count(&self, step: Step) -> usize {
             self.steps().iter().filter(|s| **s == step).count()
         }
 
-        fn at(&self, step: Step) -> Instant {
-            self.log()
-                .into_iter()
-                .find(|(s, _)| *s == step)
+        /// Where `step` first comes in the order things happened.
+        fn at(&self, step: Step) -> usize {
+            self.steps()
+                .iter()
+                .position(|s| *s == step)
                 .unwrap_or_else(|| panic!("{step:?} never happened"))
-                .1
         }
     }
 
@@ -1564,7 +1570,6 @@ mod start_order_tests {
 
         fn start_recording(&self, _: VadPolicy) -> anyhow::Result<RecordingReadiness> {
             pass(&self.0.mic_gate);
-            thread::sleep(self.0.mic_cost);
             match self.0.mic {
                 Mic::Busy => anyhow::bail!("Already recording"),
                 Mic::Fails => anyhow::bail!("Failed to open microphone"),
@@ -1579,7 +1584,7 @@ mod start_order_tests {
         }
 
         fn is_current(&self, generation: u64) -> bool {
-            generation == 1
+            generation == 1 && !self.0.stopped.load(Ordering::SeqCst)
         }
 
         fn emit_ready(&self) {
@@ -1592,8 +1597,10 @@ mod start_order_tests {
             self.record(Step::ToneEnded);
         }
 
-        fn apply_mute(&self) {
-            self.record(Step::Mute);
+        fn apply_mute(&self, generation: u64) {
+            if self.is_current(generation) {
+                self.record(Step::Mute);
+            }
         }
     }
 
@@ -1610,7 +1617,7 @@ mod start_order_tests {
     /// for the microphone's first audio. The sound plays once.
     #[test]
     fn start_sound_plays_before_the_microphone_opens() {
-        let (steps, controls) = fake(true, Mic::Works, Duration::ZERO);
+        let (steps, controls) = fake(true, Mic::Works);
         let starter = {
             let steps = steps.clone();
             thread::spawn(move || run_start(steps))
@@ -1641,7 +1648,7 @@ mod start_order_tests {
     /// ready event doesn't wait for it.
     #[test]
     fn mute_follows_the_start_sound_and_ready_does_not_wait_for_it() {
-        let (steps, controls) = fake(true, Mic::Works, Duration::ZERO);
+        let (steps, controls) = fake(true, Mic::Works);
         controls.mic_gate.send(()).unwrap();
         controls.first_audio.send(()).unwrap();
         let worker = started(run_start(steps.clone()));
@@ -1658,26 +1665,42 @@ mod start_order_tests {
         assert_eq!(steps.count(Step::Mute), 1);
     }
 
+    /// A stop while the start sound is still playing: the worker must not
+    /// mute afterwards, or system audio stays muted past the recording.
+    #[test]
+    fn a_session_stopped_during_the_start_sound_is_not_muted() {
+        let (steps, controls) = fake(true, Mic::Works);
+        controls.mic_gate.send(()).unwrap();
+        controls.first_audio.send(()).unwrap();
+        let worker = started(run_start(steps.clone()));
+
+        assert!(controls.wait_for(Step::Ready, WAIT));
+        steps.0.stopped.store(true, Ordering::SeqCst);
+        controls.tone_gate.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(steps.count(Step::Mute), 0);
+    }
+
     #[test]
     fn a_refused_start_plays_nothing_and_opens_nothing() {
-        let (steps, _controls) = fake(false, Mic::Works, Duration::ZERO);
+        let (steps, _controls) = fake(false, Mic::Works);
         assert!(matches!(run_start(steps.clone()), StartOutcome::Refused));
-        assert!(steps.log().is_empty());
+        assert!(steps.steps().is_empty());
     }
 
     #[test]
     fn a_start_into_a_busy_microphone_plays_nothing() {
-        let (steps, controls) = fake(true, Mic::Busy, Duration::ZERO);
+        let (steps, controls) = fake(true, Mic::Busy);
         drop(controls);
         assert!(matches!(run_start(steps.clone()), StartOutcome::Failed(_)));
-        assert!(steps.log().is_empty());
+        assert!(steps.steps().is_empty());
     }
 
     /// A microphone that fails to open after the press was taken: the start
     /// sound has played once, and there's no ready event or mute.
     #[test]
     fn a_failed_microphone_open_leaves_only_the_start_sound() {
-        let (steps, controls) = fake(true, Mic::Fails, Duration::ZERO);
+        let (steps, controls) = fake(true, Mic::Fails);
         drop(controls);
         assert!(matches!(run_start(steps.clone()), StartOutcome::Failed(_)));
         let deadline = Instant::now() + WAIT;
@@ -1685,30 +1708,5 @@ mod start_order_tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(steps.steps(), [Step::ToneRequested, Step::ToneEnded]);
-    }
-
-    /// Time from an accepted start to the start sound being requested, with
-    /// a microphone open that costs 150 ms. Prints the numbers:
-    /// `cargo test start_sound_latency -- --ignored --nocapture`
-    #[test]
-    #[ignore = "measurement; prints timings"]
-    fn start_sound_latency_with_a_slow_microphone_open() {
-        let mut latencies = Vec::new();
-        for _ in 0..10 {
-            let (steps, controls) = fake(true, Mic::Works, Duration::from_millis(150));
-            controls.mic_gate.send(()).unwrap();
-            controls.first_audio.send(()).unwrap();
-            controls.tone_gate.send(()).unwrap();
-            let accepted = Instant::now();
-            started(run_start(steps.clone())).join().unwrap();
-            latencies.push(steps.at(Step::ToneRequested) - accepted);
-        }
-        latencies.sort();
-        println!(
-            "start accepted -> start sound requested (mic open 150 ms): median {:?}, min {:?}, max {:?}",
-            latencies[latencies.len() / 2],
-            latencies[0],
-            latencies[latencies.len() - 1]
-        );
     }
 }
