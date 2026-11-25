@@ -239,15 +239,21 @@ pub fn with_output<T>(
         spawn_reaper();
     }
 
-    // Released on drop so a panicking `play` can't keep the stream open.
-    struct Release(Arc<MixerDeviceSink>);
+    // Released on drop so a panicking `play` can't keep the stream open. The
+    // handle goes under the lock too, so a sound that replaces this stream
+    // can't open the device while this one still holds it.
+    struct Release(Option<Arc<MixerDeviceSink>>);
     impl Drop for Release {
         fn drop(&mut self) {
-            lock().release(&self.0, Instant::now());
+            if let Some(sink) = self.0.take() {
+                let mut output = lock();
+                output.release(&sink, Instant::now());
+                drop(sink);
+            }
         }
     }
-    let sink = Release(sink);
-    play(&sink.0)
+    let lease = Release(Some(sink));
+    play(lease.0.as_ref().expect("held until drop"))
 }
 
 fn spawn_reaper() {
