@@ -20,6 +20,7 @@
 //!   Option followed by a Space tap still reads as a tap.
 
 use handy_keys::{Hotkey, KeyEvent, Modifiers};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// What the trigger asks of the coordinator.
@@ -69,13 +70,13 @@ pub struct ModifierTrigger {
     state: State,
     /// Whether the trigger modifiers were held at the last modifier event.
     held: bool,
-    /// The raw stream already showed the chord's key and handed the press
-    /// over, so the hotkey manager's report of that chord press, due before
-    /// this deadline, is a duplicate. A deadline rather than "until the next
+    /// Chord presses the raw stream already showed and handed over, oldest
+    /// first: the hotkey manager's report of each, due before its deadline,
+    /// is a duplicate. A deadline rather than "until the next
     /// hold": a stalled poll can drain a whole later hold before the
     /// manager's report, and a report that never comes must not eat a later
     /// chord.
-    absorb_chord_press: Option<Instant>,
+    absorb_chord_press: VecDeque<Instant>,
 }
 
 /// How long the manager's report of a chord press the raw stream already
@@ -99,7 +100,7 @@ impl ModifierTrigger {
             hold_threshold,
             state: State::Idle,
             held: false,
-            absorb_chord_press: None,
+            absorb_chord_press: VecDeque::new(),
         })
     }
 
@@ -151,7 +152,7 @@ impl ModifierTrigger {
         match self.state {
             State::Pressed { at } if is_chord => {
                 self.state = State::Chorded;
-                self.absorb_chord_press = Some(now + ABSORB_WINDOW);
+                self.absorb_chord_press.push_back(now + ABSORB_WINDOW);
                 Some(TriggerAction::Rebase {
                     pressed_at: at,
                     at: now,
@@ -209,7 +210,9 @@ impl ModifierTrigger {
     /// The binding's chord (from the hotkey manager) went down or up.
     pub fn on_chord(&mut self, pressed: bool, now: Instant) -> Option<TriggerAction> {
         if pressed {
-            if let Some(deadline) = self.absorb_chord_press.take() {
+            // Reports never come for expired entries; the next live one is
+            // this press's.
+            while let Some(deadline) = self.absorb_chord_press.pop_front() {
                 if now <= deadline {
                     return None;
                 }
@@ -550,6 +553,29 @@ mod tests {
         assert_eq!(
             t.on_key_event(&mods(Modifiers::empty(), false), ms(t0, 400), true),
             Some(TriggerAction::Release { at: ms(t0, 400) })
+        );
+    }
+
+    #[test]
+    fn two_stalled_chords_keep_their_reports_off_the_next_hold() {
+        let mut t = trigger();
+        let t0 = Instant::now();
+        for n in 0..2u64 {
+            let base = n * 200;
+            t.on_key_event(&mods(OPT, true), ms(t0, base), true);
+            t.on_key_event(&key(OPT, Key::Space, true), ms(t0, base + 50), true);
+            t.on_key_event(&mods(Modifiers::empty(), false), ms(t0, base + 100), true);
+        }
+        let held = ms(t0, 500);
+        t.on_key_event(&mods(OPT, true), held, true);
+        for n in 0..2u64 {
+            assert_eq!(t.on_chord(true, ms(t0, 510 + n)), None);
+            t.on_chord(false, ms(t0, 520 + n));
+        }
+        // The bare hold is still its own: typing discards it.
+        assert_eq!(
+            t.on_key_event(&key(OPT, Key::E, true), ms(t0, 600), true),
+            Some(TriggerAction::Discard { pressed_at: held })
         );
     }
 

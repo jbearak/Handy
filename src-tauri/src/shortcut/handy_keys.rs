@@ -136,10 +136,10 @@ impl ModifierTriggerRuntime {
     /// Feed the listener's queued events to the machine.
     fn drain(&mut self, app: &AppHandle) {
         while let Some(event) = self.listener.try_recv() {
-            // Secure Input hides the keys that would discard a press. With no
-            // model, every Option keystroke would raise "no model selected";
-            // leave that notice to the shortcut itself.
-            // Only a modifier going down can start anything.
+            // Only a modifier going down can start anything. Secure Input
+            // hides the keys that would discard a press. With no model, every
+            // Option keystroke would raise "no model selected"; leave that
+            // notice to the shortcut itself.
             let can_start = event.key.is_some()
                 || !event.is_key_down
                 || (!crate::secure_input::is_enabled_now()
