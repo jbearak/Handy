@@ -11,7 +11,7 @@ use crate::audio_toolkit::audio::output_device_name;
 use log::{debug, warn};
 use rodio::cpal::traits::{DeviceTrait, HostTrait};
 use rodio::{cpal, DeviceSinkBuilder, MixerDeviceSink};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -205,12 +205,19 @@ pub fn with_output<T>(
     // Names can repeat, so tell devices apart by ID. A stream on the default
     // and one on the same device picked by name behave differently once the
     // system default changes, so they don't share a key.
-    let Ok(id) = device.id() else {
-        // Without an ID there's no telling devices apart, so don't reuse.
-        let sink = open_sink(device, Arc::new(AtomicBool::new(false)))?;
-        return play(&sink);
+    let key = match device.id() {
+        Ok(id) => format!("{}{id}", if follows_default { "default:" } else { "" }),
+        // Without an ID there's no telling devices apart, so use a key that
+        // never matches. It still goes through the cache, so it opens and
+        // closes under the lock like any other stream.
+        Err(_) => {
+            static UNIDENTIFIED: AtomicU64 = AtomicU64::new(0);
+            format!(
+                "unidentified:{}",
+                UNIDENTIFIED.fetch_add(1, Ordering::Relaxed)
+            )
+        }
     };
-    let key = format!("{}{id}", if follows_default { "default:" } else { "" });
 
     let (sink, start_reaper) = {
         let mut output = lock();
@@ -324,7 +331,7 @@ mod tests {
 
         assert_eq!(opens, 2);
         assert!(!Arc::ptr_eq(&a, &b));
-        // Nothing was playing on it, so it closed before the reopen.
+        // The cache let go of it before the reopen; only the test holds it.
         assert_eq!(Arc::strong_count(&a), 1);
     }
 
