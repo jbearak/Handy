@@ -26,11 +26,13 @@ use crate::TranscriptionCoordinator;
 /// * `binding_id` - The ID of the binding (e.g., "transcribe", "cancel")
 /// * `hotkey_string` - The string representation of the hotkey
 /// * `is_pressed` - Whether this is a key press (true) or release (false)
+/// * `at` - When the key event was observed; holds are timed from it
 pub fn handle_shortcut_event(
     app: &AppHandle,
     binding_id: &str,
     hotkey_string: &str,
     is_pressed: bool,
+    at: std::time::Instant,
 ) {
     let settings = get_settings(app);
 
@@ -43,6 +45,7 @@ pub fn handle_shortcut_event(
                 is_pressed,
                 settings.shortcut_activation,
                 std::time::Duration::from_millis(settings.hold_threshold_ms),
+                at,
             );
         } else {
             warn!("TranscriptionCoordinator is not initialized");

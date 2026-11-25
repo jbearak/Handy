@@ -790,8 +790,9 @@ impl TranscriptionCoordinator {
         Self { tx }
     }
 
-    /// Send a keyboard input event for a transcribe binding. `hold_threshold`
-    /// only matters for [`ShortcutActivation::HoldOrToggle`].
+    /// Send a keyboard input event for a transcribe binding, observed at
+    /// `at`. `hold_threshold` only matters for
+    /// [`ShortcutActivation::HoldOrToggle`].
     pub fn send_input(
         &self,
         binding_id: &str,
@@ -799,6 +800,7 @@ impl TranscriptionCoordinator {
         is_pressed: bool,
         mode: ShortcutActivation,
         hold_threshold: Duration,
+        at: Instant,
     ) {
         self.send_command(Command::Input(InputEvent {
             binding_id: binding_id.to_string(),
@@ -808,7 +810,7 @@ impl TranscriptionCoordinator {
             hold_threshold,
             external: false,
             distinct: false,
-            received_at: Instant::now(),
+            received_at: at,
         }));
     }
 

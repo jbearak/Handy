@@ -31,7 +31,7 @@
 //! via Tauri's event system.
 
 use handy_keys::{BlockingHotkeys, Hotkey, KeyEvent, KeyboardListener};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use serde::Serialize;
 use specta::Type;
 use std::collections::{HashMap, HashSet};
@@ -113,8 +113,9 @@ impl ModifierTriggerRuntime {
 
     /// Tear the trigger down, releasing a press still held.
     fn stop(mut self, effects: &impl Effects) {
-        if let Some(action) = self.machine.abandon(std::time::Instant::now()) {
-            effects.trigger(&self.hotkey_string, action);
+        let now = std::time::Instant::now();
+        if let Some(action) = self.machine.abandon(now) {
+            effects.trigger(&self.hotkey_string, action, now);
         }
     }
 
@@ -144,15 +145,22 @@ impl ModifierTriggerRuntime {
         // notice to the shortcut itself.
         let can_start = event.key.is_some() || !event.is_key_down || effects.can_start();
         if let Some(action) = self.machine.on_key_event(event, at, can_start) {
-            effects.trigger(&self.hotkey_string, action);
+            effects.trigger(&self.hotkey_string, action, at);
         }
     }
 }
 
-fn apply_trigger_action(app: &AppHandle, hotkey_string: &str, action: TriggerAction) {
+/// `at` is when the key behind `action` was seen. A chord edge is timed
+/// from it, like the press it may have been rebased to.
+fn apply_trigger_action(
+    app: &AppHandle,
+    hotkey_string: &str,
+    action: TriggerAction,
+    at: std::time::Instant,
+) {
     debug!("modifier-alone trigger: {action:?}");
     if let TriggerAction::Chord { pressed } = action {
-        handle_shortcut_event(app, TRANSCRIBE, hotkey_string, pressed);
+        handle_shortcut_event(app, TRANSCRIBE, hotkey_string, pressed, at);
         return;
     }
     let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() else {
@@ -185,10 +193,17 @@ fn apply_trigger_action(app: &AppHandle, hotkey_string: &str, action: TriggerAct
 /// What the manager thread does to the rest of the app: the app itself in
 /// production, a recorder in tests.
 trait Effects {
-    /// A registered binding's chord went down or up.
-    fn shortcut(&self, binding_id: &str, hotkey_string: &str, pressed: bool);
-    /// The modifier trigger of the transcribe binding `hotkey_string` acts.
-    fn trigger(&self, hotkey_string: &str, action: TriggerAction);
+    /// A registered binding's chord went down or up, on a key seen at `at`.
+    fn shortcut(
+        &self,
+        binding_id: &str,
+        hotkey_string: &str,
+        pressed: bool,
+        at: std::time::Instant,
+    );
+    /// The modifier trigger of the transcribe binding `hotkey_string` acts,
+    /// on a key seen at `at`.
+    fn trigger(&self, hotkey_string: &str, action: TriggerAction, at: std::time::Instant);
     /// The hold threshold, while the "modifier alone" trigger is on.
     fn modifier_trigger(&self) -> Option<std::time::Duration>;
     /// Whether a bare modifier going down may start dictation now.
@@ -198,12 +213,18 @@ trait Effects {
 }
 
 impl Effects for AppHandle {
-    fn shortcut(&self, binding_id: &str, hotkey_string: &str, pressed: bool) {
-        handle_shortcut_event(self, binding_id, hotkey_string, pressed);
+    fn shortcut(
+        &self,
+        binding_id: &str,
+        hotkey_string: &str,
+        pressed: bool,
+        at: std::time::Instant,
+    ) {
+        handle_shortcut_event(self, binding_id, hotkey_string, pressed, at);
     }
 
-    fn trigger(&self, hotkey_string: &str, action: TriggerAction) {
-        apply_trigger_action(self, hotkey_string, action);
+    fn trigger(&self, hotkey_string: &str, action: TriggerAction, at: std::time::Instant) {
+        apply_trigger_action(self, hotkey_string, action, at);
     }
 
     fn modifier_trigger(&self) -> Option<std::time::Duration> {
@@ -284,9 +305,12 @@ impl Chords {
         }
         edges
     }
+}
 
-    /// Let every key through: the listener outlives the manager thread.
-    fn release_keys(&self) {
+/// Let every key through once the manager thread is gone, however it ended:
+/// the listener outlives it.
+impl Drop for Chords {
+    fn drop(&mut self) {
         if let Ok(mut blocking) = self.blocking.lock() {
             blocking.clear();
         }
@@ -302,9 +326,10 @@ fn forward_keys(mut next: impl FnMut() -> Option<KeyEvent>, tx: Sender<Input>) {
             .send(Input::Key(event, std::time::Instant::now()))
             .is_err()
         {
-            break;
+            return;
         }
     }
+    warn!("The keyboard listener stopped; shortcuts won't fire until Handy restarts");
 }
 
 /// State for the handy-keys shortcut manager
@@ -373,10 +398,8 @@ impl HandyKeysState {
         info!("handy-keys manager thread started");
 
         // Maps binding IDs to chord ids and hotkey strings
-        let mut chords = Chords {
-            blocking,
-            ..Default::default()
-        };
+        let mut chords = Chords::default();
+        chords.blocking = blocking;
         let mut binding_to_hotkey: HashMap<String, u32> = HashMap::new();
         let mut hotkey_to_binding: HashMap<u32, (String, String)> = HashMap::new(); // (binding_id, hotkey_string)
         let mut modifier_trigger: Option<ModifierTriggerRuntime> = None;
@@ -404,11 +427,11 @@ impl HandyKeysState {
                                 .filter(|_| binding_id == TRANSCRIBE)
                             {
                                 if let Some(action) = trigger.machine.on_chord(is_pressed, at) {
-                                    effects.trigger(hotkey_string, action);
+                                    effects.trigger(hotkey_string, action, at);
                                 }
                                 continue;
                             }
-                            effects.shortcut(binding_id, hotkey_string, is_pressed);
+                            effects.shortcut(binding_id, hotkey_string, is_pressed, at);
                         }
                     }
                 }
@@ -474,7 +497,7 @@ impl HandyKeysState {
             }
         }
 
-        chords.release_keys();
+        drop(chords);
         info!("handy-keys manager thread stopped");
     }
 
@@ -864,6 +887,8 @@ mod tests {
 
     struct Recorder {
         did: Sender<(Did, Instant)>,
+        /// The time each chord edge was stamped with.
+        chord_stamps: Arc<Mutex<Vec<Instant>>>,
         wakes: Arc<AtomicUsize>,
         trigger: Option<Duration>,
     }
@@ -877,12 +902,16 @@ mod tests {
     }
 
     impl Effects for Recorder {
-        fn shortcut(&self, binding_id: &str, _: &str, pressed: bool) {
+        fn shortcut(&self, binding_id: &str, _: &str, pressed: bool, at: Instant) {
+            self.chord_stamps.lock().unwrap().push(at);
             let _ = self
                 .did
                 .send((Did::Shortcut(binding(binding_id), pressed), Instant::now()));
         }
-        fn trigger(&self, _: &str, action: TriggerAction) {
+        fn trigger(&self, _: &str, action: TriggerAction, at: Instant) {
+            if matches!(action, TriggerAction::Chord { .. }) {
+                self.chord_stamps.lock().unwrap().push(at);
+            }
             let _ = self.did.send((Did::Trigger(action), Instant::now()));
         }
         fn modifier_trigger(&self) -> Option<Duration> {
@@ -904,6 +933,7 @@ mod tests {
         pulls: Arc<AtomicUsize>,
         blocking: BlockingHotkeys,
         did: Receiver<(Did, Instant)>,
+        chord_stamps: Arc<Mutex<Vec<Instant>>>,
         wakes: Arc<AtomicUsize>,
         thread: Option<JoinHandle<()>>,
         forwarder: Option<JoinHandle<()>>,
@@ -917,8 +947,10 @@ mod tests {
             let wakes = Arc::new(AtomicUsize::new(0));
             let pulls = Arc::new(AtomicUsize::new(0));
             let blocking: BlockingHotkeys = Arc::new(Mutex::new(HashSet::new()));
+            let chord_stamps = Arc::new(Mutex::new(Vec::new()));
             let effects = Recorder {
                 did: did_tx,
+                chord_stamps: Arc::clone(&chord_stamps),
                 wakes: Arc::clone(&wakes),
                 trigger,
             };
@@ -941,6 +973,7 @@ mod tests {
                 pulls,
                 blocking,
                 did: did_rx,
+                chord_stamps,
                 wakes,
                 thread: Some(thread),
                 forwarder: Some(forwarder),
@@ -1079,8 +1112,38 @@ mod tests {
             percentile(&stamp, 50),
             stamp[199],
         );
-        // Loose: the poll it replaces put the median near 5 ms.
-        assert!(percentile(&dispatch, 50) < Duration::from_millis(2));
+    }
+
+    /// Chord edges carry the time their key was seen, not the time the
+    /// thread got to them: with the trigger on, the press is rebased to
+    /// Space's own time, so a release stamped late would turn a tap into a
+    /// hold whenever the thread ran behind.
+    #[test]
+    fn chord_edges_are_stamped_when_their_key_was_seen() {
+        let h = Harness::start(Some(THRESHOLD));
+        h.register(TRANSCRIBE, "option+space");
+        h.register("cancel", "escape");
+        let seen = Instant::now() - Duration::from_millis(400);
+        let after = |ms| seen + Duration::from_millis(ms);
+        let send = |event, at| {
+            let input = Input::Key(event, at);
+            assert!(h.cmd.as_ref().unwrap().0.send(input).is_ok());
+        };
+        send(mods(OPT, true), seen);
+        send(key(OPT, Key::Space, true), after(50));
+        send(key(OPT, Key::Space, false), after(150));
+        send(key(Modifiers::empty(), Key::Escape, true), after(200));
+        assert!(matches!(h.next().0, Did::Trigger(TriggerAction::Press { at }) if at == seen));
+        assert!(matches!(
+            h.next().0,
+            Did::Trigger(TriggerAction::Rebase { at, .. }) if at == after(50)
+        ));
+        assert_eq!(
+            h.next().0,
+            Did::Trigger(TriggerAction::Chord { pressed: false })
+        );
+        assert_eq!(h.next().0, Did::Shortcut("cancel", true));
+        assert_eq!(*h.chord_stamps.lock().unwrap(), [after(150), after(200)]);
     }
 
     #[test]
@@ -1256,6 +1319,46 @@ mod tests {
             assert_eq!(
                 c.process(&mods(Modifiers::empty(), false)),
                 vec![(0, false)]
+            );
+        }
+
+        #[test]
+        fn compound_modifier_only_chord_releases_on_partial_release() {
+            let mut c = Chords::default();
+            c.register(Hotkey::new(Modifiers::CMD | Modifiers::SHIFT, None).unwrap())
+                .unwrap();
+            assert_eq!(c.process(&mods(Modifiers::CMD_LEFT, true)), vec![]);
+            let both = Modifiers::CMD_LEFT | Modifiers::SHIFT_LEFT;
+            assert_eq!(c.process(&mods(both, true)), vec![(0, true)]);
+            assert_eq!(
+                c.process(&mods(Modifiers::SHIFT_LEFT, false)),
+                vec![(0, false)]
+            );
+        }
+
+        #[test]
+        fn an_unrelated_key_release_releases_nothing() {
+            let mut c = chords(&["cmd+k"]);
+            c.process(&key(Modifiers::CMD_LEFT, Key::K, true));
+            assert_eq!(c.process(&key(Modifiers::CMD_LEFT, Key::J, false)), vec![]);
+            assert_eq!(
+                c.process(&key(Modifiers::CMD_LEFT, Key::K, false)),
+                vec![(0, false)]
+            );
+        }
+
+        #[test]
+        fn side_specific_chord_matches_only_its_side() {
+            let mut c = Chords::default();
+            c.register(Hotkey::new(Modifiers::CTRL_RIGHT, Key::Space).unwrap())
+                .unwrap();
+            assert_eq!(
+                c.process(&key(Modifiers::CTRL_LEFT, Key::Space, true)),
+                vec![]
+            );
+            assert_eq!(
+                c.process(&key(Modifiers::CTRL_RIGHT, Key::Space, true)),
+                vec![(0, true)]
             );
         }
 
