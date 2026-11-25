@@ -389,6 +389,10 @@
           "push_to_talk": "Nimmt auf, solange die Tastenkombination gedrückt bleibt",
           "toggle": "Tastenkombination antippen, um die Aufnahme zu starten, erneut antippen zum Stoppen"
         }
+      },
+      "modifierAlone": {
+        "label": "Nur {{modifiers}} verwenden",
+        "description": "Drücke {{modifiers}} allein, um zu diktieren, genau wie mit deinem Tastenkürzel. Tippen oder Klicken, während du sie hältst, bricht die Aufnahme ab."
       }
     },
     "models": {

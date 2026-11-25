@@ -389,6 +389,10 @@
           "push_to_talk": "Enregistre tant que le raccourci est maintenu",
           "toggle": "Appuyez sur le raccourci pour démarrer l'enregistrement, appuyez à nouveau pour arrêter"
         }
+      },
+      "modifierAlone": {
+        "label": "Utiliser {{modifiers}} seul",
+        "description": "Appuyez sur {{modifiers}} seul pour dicter, comme avec votre raccourci. Taper ou cliquer en la maintenant enfoncée annule l'enregistrement."
       }
     },
     "models": {

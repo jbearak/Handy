@@ -389,6 +389,10 @@
           "push_to_talk": "Neemt op zolang je de sneltoets ingedrukt houdt",
           "toggle": "Tik op de sneltoets om de opname te starten, tik opnieuw om te stoppen"
         }
+      },
+      "modifierAlone": {
+        "label": "Alleen {{modifiers}} gebruiken",
+        "description": "Druk alleen op {{modifiers}} om te dicteren, net als met je sneltoets. Typen of klikken terwijl je hem ingedrukt houdt, annuleert de opname."
       }
     },
     "models": {

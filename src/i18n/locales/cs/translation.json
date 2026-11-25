@@ -389,6 +389,10 @@
           "push_to_talk": "Nahrává, dokud držíte zkratku",
           "toggle": "Klepněte na zkratku pro zahájení nahrávání, klepněte znovu pro zastavení"
         }
+      },
+      "modifierAlone": {
+        "label": "Použít samotný {{modifiers}}",
+        "description": "Stiskněte samotný {{modifiers}} a diktujte stejně jako zkratkou. Psaní nebo kliknutí, zatímco ho držíte, nahrávání zruší."
       }
     },
     "models": {

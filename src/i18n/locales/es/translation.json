@@ -389,6 +389,10 @@
           "push_to_talk": "Graba mientras mantienes pulsado el atajo",
           "toggle": "Toca el atajo para empezar a grabar, tócalo de nuevo para detener"
         }
+      },
+      "modifierAlone": {
+        "label": "Usar solo {{modifiers}}",
+        "description": "Pulsa solo {{modifiers}} para dictar, igual que con tu atajo. Escribir o hacer clic mientras la mantienes pulsada cancela la grabación."
       }
     },
     "models": {

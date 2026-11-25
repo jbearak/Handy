@@ -389,6 +389,10 @@
           "push_to_talk": "按住快捷键期间录音",
           "toggle": "轻按快捷键开始录音，再次轻按停止"
         }
+      },
+      "modifierAlone": {
+        "label": "单独使用 {{modifiers}}",
+        "description": "单独按下 {{modifiers}} 即可听写，与快捷键用法相同。按住时打字或点击会取消录音。"
       }
     },
     "models": {

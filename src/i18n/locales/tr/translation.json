@@ -389,6 +389,10 @@
           "push_to_talk": "Kısayolu basılı tuttuğunuz sürece kaydeder",
           "toggle": "Kaydı başlatmak için kısayola dokunun, durdurmak için tekrar dokunun"
         }
+      },
+      "modifierAlone": {
+        "label": "Yalnızca {{modifiers}} Kullan",
+        "description": "Dikte etmek için kısayolunuzda olduğu gibi yalnızca {{modifiers}} tuşuna basın. Basılı tutarken yazmak veya tıklamak kaydı iptal eder."
       }
     },
     "models": {

@@ -389,6 +389,10 @@
           "push_to_talk": "Records while you hold the shortcut",
           "toggle": "Tap the shortcut to start recording, tap again to stop"
         }
+      },
+      "modifierAlone": {
+        "label": "Use {{modifiers}} Alone",
+        "description": "Press {{modifiers}} by itself to dictate, just like your shortcut. Typing or clicking while holding it cancels the recording."
       }
     },
     "models": {

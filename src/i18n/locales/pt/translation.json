@@ -389,6 +389,10 @@
           "push_to_talk": "Grava enquanto você mantém o atalho pressionado",
           "toggle": "Toque no atalho para começar a gravar, toque novamente para parar"
         }
+      },
+      "modifierAlone": {
+        "label": "Usar apenas {{modifiers}}",
+        "description": "Pressione apenas {{modifiers}} para ditar, como com o seu atalho. Digitar ou clicar enquanto a mantém pressionada cancela a gravação."
       }
     },
     "models": {

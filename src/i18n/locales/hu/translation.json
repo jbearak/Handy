@@ -389,6 +389,10 @@
           "push_to_talk": "Addig rögzít, amíg nyomva tartod a billentyűparancsot",
           "toggle": "Koppints a billentyűparancsra a felvétel indításához, és újra a leállításához"
         }
+      },
+      "modifierAlone": {
+        "label": "Csak {{modifiers}} használata",
+        "description": "Nyomja meg csak a(z) {{modifiers}} billentyűt a diktáláshoz, akárcsak a billentyűparancsot. Ha lenyomva tartása közben gépel vagy kattint, a felvétel megszakad."
       }
     },
     "models": {
