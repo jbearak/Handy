@@ -775,7 +775,8 @@
       },
       "soundTheme": {
         "label": "سمة الصوت",
-        "description": "اختر سمة صوت لتنبيهات بدء وتوقف التسجيل"
+        "description": "اختر سمة صوت لتنبيهات بدء وتوقف التسجيل",
+        "hex": "Hex"
       },
       "wordCorrectionThreshold": {
         "title": "عتبة تصحيح الكلمات",

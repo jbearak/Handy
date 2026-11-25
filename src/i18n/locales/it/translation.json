@@ -775,7 +775,8 @@
       },
       "soundTheme": {
         "label": "Tema Sonoro",
-        "description": "Scegli un tema sonoro per il feedback di inizio e fine registrazione"
+        "description": "Scegli un tema sonoro per il feedback di inizio e fine registrazione",
+        "hex": "Hex"
       },
       "wordCorrectionThreshold": {
         "title": "Soglia di Correzione Parole",

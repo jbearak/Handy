@@ -775,7 +775,8 @@
       },
       "soundTheme": {
         "label": "Hangtéma",
-        "description": "Válassz hangtémát a felvétel indítási és leállítási hangjelzéséhez"
+        "description": "Válassz hangtémát a felvétel indítási és leállítási hangjelzéséhez",
+        "hex": "Hex"
       },
       "wordCorrectionThreshold": {
         "title": "Szójavítási küszöb",

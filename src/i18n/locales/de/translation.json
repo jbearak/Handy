@@ -775,7 +775,8 @@
       },
       "soundTheme": {
         "label": "Sound-Thema",
-        "description": "Sound-Thema für Aufnahme-Start und -Stop-Feedback auswählen"
+        "description": "Sound-Thema für Aufnahme-Start und -Stop-Feedback auswählen",
+        "hex": "Hex"
       },
       "wordCorrectionThreshold": {
         "title": "Wortkorrektur-Schwelle",

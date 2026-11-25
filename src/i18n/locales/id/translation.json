@@ -775,7 +775,8 @@
       },
       "soundTheme": {
         "label": "Tema Suara",
-        "description": "Pilih tema suara untuk umpan balik saat perekaman dimulai dan dihentikan"
+        "description": "Pilih tema suara untuk umpan balik saat perekaman dimulai dan dihentikan",
+        "hex": "Hex"
       },
       "wordCorrectionThreshold": {
         "title": "Ambang Koreksi Kata",

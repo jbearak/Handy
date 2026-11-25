@@ -526,5 +526,6 @@ Handy is open-source software, but the Handy name, logo, icon, and brand assets 
 - **Whisper** by OpenAI for the speech recognition model
 - **ggml** for an amazing cross-platform tensor library
 - **Silero** for great lightweight VAD
+- **[Hex](https://github.com/anomalyco/hex)** for the Hex sound theme's start and stop sounds (MIT, see [`src-tauri/resources/HEX_SOUNDS_LICENSE.txt`](src-tauri/resources/HEX_SOUNDS_LICENSE.txt))
 - **Tauri** team for the excellent Rust-based app framework
 - **Community contributors** helping make Handy better

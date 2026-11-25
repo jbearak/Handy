@@ -775,7 +775,8 @@
       },
       "soundTheme": {
         "label": "ערכת צלילים",
-        "description": "בחר ערכת צלילים להתחלה ולסיום ההקלטה"
+        "description": "בחר ערכת צלילים להתחלה ולסיום ההקלטה",
+        "hex": "Hex"
       },
       "wordCorrectionThreshold": {
         "title": "סף תיקון מילים",
