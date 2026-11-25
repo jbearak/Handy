@@ -2174,4 +2174,46 @@ mod tests {
             Some(Effect::Start { .. })
         ));
     }
+
+    /// Mirrors the coordinator loop with a fake clock: while a release is
+    /// deferred, the loop sleeps in `recv_timeout` until the deadline and then
+    /// runs `on_grace_expired`. Returns when the Stop effect ran, if one did.
+    fn run_grace_timer(state: &mut CoordinatorState, clock: &mut Instant) -> Option<Instant> {
+        while let Some(deadline) = state.grace_deadline() {
+            *clock = (*clock).max(deadline);
+            if let Some(Effect::Stop { .. }) = state.on_grace_expired() {
+                return Some(*clock);
+            }
+        }
+        None
+    }
+
+    /// Time from a hold's key-up to the Stop effect, for push-to-talk and an
+    /// Auto (hold-or-toggle) hold past the threshold.
+    #[test]
+    fn hold_release_to_stop_latency() {
+        for mode in [
+            ShortcutActivation::PushToTalk,
+            ShortcutActivation::HoldOrToggle,
+        ] {
+            let mut state = CoordinatorState::new();
+            let t0 = Instant::now();
+            assert!(matches!(
+                state.on_input(press_at(mode, true, t0), t0),
+                Some(Effect::Start { .. })
+            ));
+            let released_at = t0 + ms(800);
+            let mut clock = released_at;
+            let stopped_at =
+                match state.on_input(press_at(mode, false, released_at), released_at) {
+                    Some(Effect::Stop { .. }) => Some(clock),
+                    _ => run_grace_timer(&mut state, &mut clock),
+                }
+                .expect("a hold release must stop recording");
+            let latency = stopped_at - released_at;
+            eprintln!("{mode:?}: hold release to Stop = {latency:?}");
+            assert_eq!(latency, RELEASE_GRACE);
+            assert_eq!(state.stage, Stage::Processing);
+        }
+    }
 }
