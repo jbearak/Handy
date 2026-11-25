@@ -519,6 +519,16 @@ impl RecordingReadiness {
     pub fn generation(&self) -> u64 {
         self.generation
     }
+
+    /// A readiness that ends when `receiver` gets a message (ready) or its
+    /// sender is dropped (not ready), for tests driving the start sequence.
+    #[cfg(test)]
+    pub(crate) fn for_test(receiver: mpsc::Receiver<()>, generation: u64) -> Self {
+        Self {
+            receiver,
+            generation,
+        }
+    }
 }
 
 #[derive(Clone)]
