@@ -116,8 +116,8 @@ impl<S> WarmOutput<S> {
         }
     }
 
-    /// Closes the stream if it's been idle for the timeout. A closed stream
-    /// is returned so the caller can drop it outside the lock.
+    /// Takes the stream if it's been idle for the timeout, for the caller to
+    /// drop.
     fn reap(&mut self, now: Instant) -> (Reap, Option<Arc<S>>) {
         let Some(entry) = self.entry.as_ref() else {
             return (Reap::Empty, None);
@@ -254,18 +254,21 @@ fn spawn_reaper() {
     let spawned = thread::Builder::new()
         .name("feedback-output-reaper".into())
         .spawn(|| loop {
-            let (next, closed) = {
+            let next = {
                 let mut output = lock();
                 let (next, closed) = output.reap(Instant::now());
                 if !matches!(next, Reap::Wait(_)) {
                     output.reaper_running = false;
                 }
-                (next, closed)
+                // Close under the lock, so a sound arriving now waits for the
+                // device to be free before reopening it (some outputs allow
+                // only one stream).
+                drop(closed);
+                next
             };
             match next {
                 Reap::Wait(wait) => thread::sleep(wait.max(Duration::from_millis(50))),
                 Reap::Closed => {
-                    drop(closed);
                     debug!("Closed idle feedback output");
                     return;
                 }
