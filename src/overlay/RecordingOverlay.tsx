@@ -132,8 +132,9 @@ const RecordingOverlay: React.FC = () => {
           // Paint now. Nothing here waits on Rust, so the pill appears with the
           // key press rather than after settings round trips.
           setIsVisible(true);
-          // Catch a language change made in the settings window. Labels only
-          // show once recording ends, so this lands well before they do.
+          // Catch a language change made in the settings window. Recording
+          // shows no text, so only a notice's title can briefly show in the
+          // old language until this lands.
           void syncLanguageFromSettings();
         },
       );

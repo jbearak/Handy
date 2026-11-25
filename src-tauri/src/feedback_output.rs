@@ -9,7 +9,7 @@
 
 use crate::audio_toolkit::audio::output_device_name;
 use log::{debug, warn};
-use rodio::cpal::traits::HostTrait;
+use rodio::cpal::traits::{DeviceTrait, HostTrait};
 use rodio::{cpal, DeviceSinkBuilder, MixerDeviceSink};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -19,9 +19,13 @@ use std::time::{Duration, Instant};
 /// How long the output stays open after the last sound ends.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How often the reaper checks back while a sound is playing, so the idle
+/// clock is noticed soon after it starts.
+const PLAYING_POLL: Duration = Duration::from_secs(1);
+
 /// An open output and what's needed to decide whether it can be reused.
 struct Entry<S> {
-    /// Name of the device the stream was opened on.
+    /// Identifies the device the stream was opened on.
     device: String,
     sink: Arc<S>,
     /// Set by the stream's error callback once the stream is unusable.
@@ -62,8 +66,10 @@ impl<S> WarmOutput<S> {
 
     /// Returns the open stream for `device`, opening one with `open` if
     /// there's none, it's for another device, it failed, or it's idle past the
-    /// timeout. `open` gets the flag its error callback should set. Also
-    /// returns any stream it replaced, for the caller to drop outside the lock.
+    /// timeout. `open` gets the flag its error callback should set. A replaced
+    /// stream with nothing playing is closed before the open, since some
+    /// outputs allow only one stream; one still playing is returned for the
+    /// caller to drop outside the lock.
     #[allow(clippy::type_complexity)]
     fn acquire<E>(
         &mut self,
@@ -76,7 +82,11 @@ impl<S> WarmOutput<S> {
         });
         let mut stale = None;
         if !reusable {
-            stale = self.entry.take().map(|e| e.sink);
+            if let Some(old) = self.entry.take() {
+                if old.playing > 0 {
+                    stale = Some(old.sink);
+                }
+            }
             let failed = Arc::new(AtomicBool::new(false));
             let sink = Arc::new(open(failed.clone())?);
             self.entry = Some(Entry {
@@ -117,7 +127,7 @@ impl<S> WarmOutput<S> {
         }
         let wait = match entry.idle_since {
             Some(since) => self.idle_timeout.saturating_sub(now - since),
-            None => self.idle_timeout,
+            None => PLAYING_POLL.min(self.idle_timeout),
         };
         (Reap::Wait(wait), None)
     }
@@ -140,15 +150,18 @@ fn lock() -> std::sync::MutexGuard<'static, WarmOutput<MixerDeviceSink>> {
 }
 
 /// Picks the device the way Handy always has: the selected output if it's
-/// present, else the system default.
-fn resolve_device(selected: Option<&str>) -> Result<cpal::Device, Box<dyn std::error::Error>> {
+/// present, else the system default. Also says whether it's the default,
+/// whose stream follows the system default on macOS.
+fn resolve_device(
+    selected: Option<&str>,
+) -> Result<(cpal::Device, bool), Box<dyn std::error::Error>> {
     if let Some(name) = selected.filter(|n| *n != "Default") {
         let host = crate::audio_toolkit::get_cpal_host();
         let found = host
             .output_devices()?
             .find(|device| output_device_name(device).as_deref() == Some(name));
         match found {
-            Some(device) => return Ok(device),
+            Some(device) => return Ok((device, false)),
             None => warn!("Device '{}' not found, using default device", name),
         }
     } else {
@@ -157,6 +170,7 @@ fn resolve_device(selected: Option<&str>) -> Result<cpal::Device, Box<dyn std::e
     // The same lookup rodio's `from_default_device` does.
     cpal::default_host()
         .default_output_device()
+        .map(|device| (device, true))
         .ok_or_else(|| "no default output device".into())
 }
 
@@ -193,21 +207,25 @@ pub fn with_output<T>(
     selected_device: Option<&str>,
     play: impl FnOnce(&MixerDeviceSink) -> Result<T, Box<dyn std::error::Error>>,
 ) -> Result<T, Box<dyn std::error::Error>> {
-    let device = resolve_device(selected_device)?;
-    let Some(name) = output_device_name(&device) else {
-        // Without a name there's no telling devices apart, so don't reuse.
+    let (device, follows_default) = resolve_device(selected_device)?;
+    // Names can repeat, so tell devices apart by ID. A stream on the default
+    // and one on the same device picked by name behave differently once the
+    // system default changes, so they don't share a key.
+    let Ok(id) = device.id() else {
+        // Without an ID there's no telling devices apart, so don't reuse.
         let sink = open_sink(device, Arc::new(AtomicBool::new(false)))?;
         return play(&sink);
     };
+    let key = format!("{}{id}", if follows_default { "default:" } else { "" });
 
     let (sink, stale, start_reaper) = {
         let mut output = lock();
-        let (sink, stale) = output.acquire(&name, Instant::now(), |failed| {
+        let (sink, stale) = output.acquire(&key, Instant::now(), |failed| {
             let started = Instant::now();
             let sink = open_sink(device, failed);
             debug!(
                 "Opened feedback output '{}' in {:?}",
-                name,
+                key,
                 started.elapsed()
             );
             sink
@@ -304,7 +322,9 @@ mod tests {
 
         assert_eq!(opens, 2);
         assert!(!Arc::ptr_eq(&a, &b));
-        assert!(stale.is_some_and(|s| Arc::ptr_eq(&s, &a)));
+        // Nothing was playing on it, so it closed before the reopen.
+        assert!(stale.is_none());
+        assert_eq!(Arc::strong_count(&a), 1);
     }
 
     #[test]
@@ -359,7 +379,7 @@ mod tests {
         let (a, _) = out.acquire("Speakers", t0, opener(&mut opens)).unwrap();
         let (b, _) = out.acquire("Speakers", t0, opener(&mut opens)).unwrap();
         out.release(&a, t0);
-        assert_eq!(out.reap(t0 + IDLE * 2).0, Reap::Wait(IDLE));
+        assert_eq!(out.reap(t0 + IDLE * 2).0, Reap::Wait(PLAYING_POLL));
 
         let end = t0 + IDLE * 2;
         out.release(&b, end);
@@ -388,7 +408,7 @@ mod tests {
         out.release(&old, t0);
 
         // The new stream is still counted as playing, so it isn't reaped.
-        assert_eq!(out.reap(t0 + IDLE * 2).0, Reap::Wait(IDLE));
+        assert_eq!(out.reap(t0 + IDLE * 2).0, Reap::Wait(PLAYING_POLL));
         out.release(&new, t0);
         assert_eq!(out.reap(t0 + IDLE).0, Reap::Closed);
     }
