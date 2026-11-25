@@ -1,9 +1,7 @@
-use crate::audio_toolkit::audio::output_device_name;
+use crate::feedback_output;
 use crate::settings::SoundTheme;
 use crate::settings::{self, AppSettings};
-use log::{debug, error, warn};
-use rodio::cpal::traits::HostTrait;
-use rodio::DeviceSinkBuilder;
+use log::{debug, error};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -43,6 +41,26 @@ fn get_sound_base_dir(settings: &AppSettings) -> tauri::path::BaseDirectory {
     match settings.sound_theme {
         SoundTheme::Custom => tauri::path::BaseDirectory::AppData,
         _ => tauri::path::BaseDirectory::Resource,
+    }
+}
+
+/// Opens the feedback output ahead of the start sound, off the caller's
+/// thread. The mic takes longer to open than the output, so starting both at
+/// the key press keeps the output open from delaying the readiness cue.
+pub fn prepare_feedback_output(settings: &AppSettings) {
+    if !settings.audio_feedback {
+        return;
+    }
+    let device = settings.selected_output_device.clone();
+    let spawned = thread::Builder::new()
+        .name("feedback-output-prepare".into())
+        .spawn(move || {
+            if let Err(e) = feedback_output::prepare(device.as_deref()) {
+                debug!("Failed to prepare feedback output: {e}");
+            }
+        });
+    if let Err(e) = spawned {
+        debug!("Failed to start feedback output prepare thread: {e}");
     }
 }
 
@@ -100,44 +118,17 @@ fn play_audio_file(
     selected_device: Option<String>,
     volume: f32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sink_builder = if let Some(device_name) = selected_device {
-        if device_name == "Default" {
-            debug!("Using default device");
-            DeviceSinkBuilder::from_default_device()?
-        } else {
-            let host = crate::audio_toolkit::get_cpal_host();
-            let found_device = host
-                .output_devices()?
-                .find(|device| output_device_name(device).as_deref() == Some(&device_name));
-
-            match found_device {
-                Some(device) => DeviceSinkBuilder::from_device(device)?,
-                None => {
-                    warn!("Device '{}' not found, using default device", device_name);
-                    DeviceSinkBuilder::from_default_device()?
-                }
-            }
-        }
-    } else {
-        debug!("Using default device");
-        DeviceSinkBuilder::from_default_device()?
-    };
-
-    // rodio defaults to a fixed 2048-frame buffer, which some Bluetooth
-    // outputs reject (#2524).
-    let device_sink = sink_builder
-        .with_buffer_size(rodio::cpal::BufferSize::Default)
-        .open_stream()?;
-    let mixer = device_sink.mixer();
-
+    // Read the file before taking the output, so a bad path doesn't count as
+    // using it.
     let file = File::open(path)?;
     let buf_reader = BufReader::new(file);
 
-    let player = rodio::play(mixer, buf_reader)?;
-    player.set_volume(volume);
-    player.sleep_until_end();
-
-    Ok(())
+    feedback_output::with_output(selected_device.as_deref(), |device_sink| {
+        let player = rodio::play(device_sink.mixer(), buf_reader)?;
+        player.set_volume(volume);
+        player.sleep_until_end();
+        Ok(())
+    })
 }
 
 #[cfg(test)]

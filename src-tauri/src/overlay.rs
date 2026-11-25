@@ -629,8 +629,21 @@ fn show_overlay_state_on_main(app_handle: &AppHandle, state: &str) {
             );
         }
 
-        let _ = overlay_window.emit("show-overlay", state);
+        // Carry the placement so the page can paint at once instead of
+        // fetching settings first (the Live panel's layout flips on it).
+        let payload = ShowOverlayPayload {
+            state,
+            position: settings::get_settings(app_handle).overlay_position,
+        };
+        let _ = overlay_window.emit("show-overlay", payload);
     }
+}
+
+/// Payload of the `show-overlay` event, read by `RecordingOverlay.tsx`.
+#[derive(serde::Serialize, Clone)]
+struct ShowOverlayPayload<'a> {
+    state: &'a str,
+    position: OverlayPosition,
 }
 
 /// Notify the visible recording overlay that the input stream has delivered its

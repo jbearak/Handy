@@ -5,6 +5,7 @@ import "./RecordingOverlay.css";
 import { commands, events } from "@/bindings";
 import type {
   Notice,
+  OverlayPosition,
   StreamPhase,
   StreamPhaseEvent,
   StreamTextEvent,
@@ -23,6 +24,12 @@ type OverlayState =
   | "processing"
   | "notice"
   | "live_notice";
+
+// Sent by `show_overlay_state_on_main` in overlay.rs.
+type ShowOverlayPayload = {
+  state: OverlayState;
+  position: OverlayPosition;
+};
 
 const isNoticeState = (state: OverlayState) =>
   state === "notice" || state === "live_notice";
@@ -99,43 +106,38 @@ const RecordingOverlay: React.FC = () => {
         setNotice(event.payload);
       });
 
-      const unlistenShow = await listen("show-overlay", async (event) => {
-        const overlayState = event.payload as OverlayState;
-        clearTimeout(fadeTimerRef.current);
-        if (!isNoticeState(overlayState)) setNotice(null);
-        // Reset synchronously before settings I/O. A fast microphone can emit
-        // recording-ready while the awaits below are in flight; resetting after
-        // them would overwrite that event and leave the overlay stuck arming.
-        if (overlayState === "recording" || overlayState === "streaming") {
-          setCaptureReady(false);
-          smoothedLevelsRef.current = Array(16).fill(0);
-          setLevels(Array(WAVE_BARS).fill(0));
-          setStreamText({ committed: "", tentative: "" });
-        }
-
-        await syncLanguageFromSettings();
-        // The Live panel flows downward from a top overlay and upward from a
-        // bottom one; read the placement so the layout can flip to match.
-        try {
-          const settings = await commands.getAppSettings();
-          if (settings.status === "ok") {
-            setPosition(
-              settings.data.overlay_position === "top" ? "top" : "bottom",
-            );
+      const unlistenShow = await listen<ShowOverlayPayload>(
+        "show-overlay",
+        (event) => {
+          const { state: overlayState, position } = event.payload;
+          clearTimeout(fadeTimerRef.current);
+          if (!isNoticeState(overlayState)) setNotice(null);
+          if (overlayState === "recording" || overlayState === "streaming") {
+            setCaptureReady(false);
+            smoothedLevelsRef.current = Array(16).fill(0);
+            setLevels(Array(WAVE_BARS).fill(0));
+            setStreamText({ committed: "", tentative: "" });
           }
-        } catch {
-          // Keep the previous/default placement if settings can't be read.
-        }
-        setState(overlayState);
-        if (overlayState === "streaming") {
-          setPhase("listening");
-          setWorkKind("transcribing");
-          setElapsed(0);
-          setLoadNoticeShown(false);
-          setSession((s) => s + 1); // remount the card fresh for this session
-        }
-        setIsVisible(true);
-      });
+          // The Live panel flows downward from a top overlay and upward from a
+          // bottom one, so the placement comes with the event.
+          setPosition(position === "top" ? "top" : "bottom");
+          setState(overlayState);
+          if (overlayState === "streaming") {
+            setPhase("listening");
+            setWorkKind("transcribing");
+            setElapsed(0);
+            setLoadNoticeShown(false);
+            setSession((s) => s + 1); // remount the card fresh for this session
+          }
+          // Paint now. Nothing here waits on Rust, so the pill appears with the
+          // key press rather than after settings round trips.
+          setIsVisible(true);
+          // Catch a language change made in the settings window. Recording
+          // shows no text, so only a notice's title can briefly show in the
+          // old language until this lands.
+          void syncLanguageFromSettings();
+        },
+      );
 
       const unlistenHide = await listen("hide-overlay", () => {
         setIsVisible(false);

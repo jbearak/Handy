@@ -1,6 +1,8 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::apple_intelligence;
-use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, SoundType};
+use crate::audio_feedback::{
+    play_feedback_sound, play_feedback_sound_blocking, prepare_feedback_output, SoundType,
+};
 use crate::audio_toolkit::VadPolicy;
 use crate::managers::audio::{recording_notice_code, AudioRecordingManager};
 use crate::managers::history::HistoryManager;
@@ -615,6 +617,9 @@ impl ShortcutAction for TranscribeAction {
             overlay_started.elapsed()
         );
         debug!("Microphone mode - always_on: {}", is_always_on);
+
+        // The start sound plays once the mic is ready; have its output open by then.
+        prepare_feedback_output(&settings);
 
         let mut recording_error: Option<anyhow::Error> = None;
         let recording_start_time = Instant::now();
