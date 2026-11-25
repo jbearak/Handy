@@ -66,27 +66,21 @@ impl<S> WarmOutput<S> {
 
     /// Returns the open stream for `device`, opening one with `open` if
     /// there's none, it's for another device, it failed, or it's idle past the
-    /// timeout. `open` gets the flag its error callback should set. A replaced
-    /// stream with nothing playing is closed before the open, since some
-    /// outputs allow only one stream; one still playing is returned for the
-    /// caller to drop outside the lock.
-    #[allow(clippy::type_complexity)]
+    /// timeout. `open` gets the flag its error callback should set. The cache
+    /// lets go of a replaced stream before the open, so with nothing playing
+    /// it closes first (some outputs allow only one stream); a sound still
+    /// playing on it keeps it until that sound releases it.
     fn acquire<E>(
         &mut self,
         device: &str,
         now: Instant,
         open: impl FnOnce(Arc<AtomicBool>) -> Result<S, E>,
-    ) -> Result<(Arc<S>, Option<Arc<S>>), E> {
+    ) -> Result<Arc<S>, E> {
         let reusable = self.entry.as_ref().is_some_and(|e| {
             e.device == device && !e.failed.load(Ordering::SeqCst) && !self.expired(e, now)
         });
-        let mut stale = None;
         if !reusable {
-            if let Some(old) = self.entry.take() {
-                if old.playing > 0 {
-                    stale = Some(old.sink);
-                }
-            }
+            self.entry = None;
             let failed = Arc::new(AtomicBool::new(false));
             let sink = Arc::new(open(failed.clone())?);
             self.entry = Some(Entry {
@@ -100,7 +94,7 @@ impl<S> WarmOutput<S> {
         let entry = self.entry.as_mut().expect("entry was just ensured");
         entry.playing += 1;
         entry.idle_since = None;
-        Ok((entry.sink.clone(), stale))
+        Ok(entry.sink.clone())
     }
 
     /// Marks a sound on `sink` as finished, starting the idle clock when it
@@ -218,9 +212,9 @@ pub fn with_output<T>(
     };
     let key = format!("{}{id}", if follows_default { "default:" } else { "" });
 
-    let (sink, stale, start_reaper) = {
+    let (sink, start_reaper) = {
         let mut output = lock();
-        let (sink, stale) = output.acquire(&key, Instant::now(), |failed| {
+        let sink = output.acquire(&key, Instant::now(), |failed| {
             let started = Instant::now();
             let sink = open_sink(device, failed);
             debug!(
@@ -232,9 +226,8 @@ pub fn with_output<T>(
         })?;
         let start_reaper = !output.reaper_running;
         output.reaper_running = true;
-        (sink, stale, start_reaper)
+        (sink, start_reaper)
     };
-    drop(stale);
     if start_reaper {
         spawn_reaper();
     }
@@ -308,10 +301,10 @@ mod tests {
         let mut opens = 0;
         let t0 = Instant::now();
 
-        let (a, _) = out.acquire("Speakers", t0, opener(&mut opens)).unwrap();
+        let a = out.acquire("Speakers", t0, opener(&mut opens)).unwrap();
         out.release(&a, t0);
         let later = t0 + IDLE - Duration::from_millis(1);
-        let (b, _) = out.acquire("Speakers", later, opener(&mut opens)).unwrap();
+        let b = out.acquire("Speakers", later, opener(&mut opens)).unwrap();
 
         assert_eq!(opens, 1);
         assert!(Arc::ptr_eq(&a, &b));
@@ -323,16 +316,15 @@ mod tests {
         let mut opens = 0;
         let t0 = Instant::now();
 
-        let (a, _) = out.acquire("Speakers", t0, opener(&mut opens)).unwrap();
+        let a = out.acquire("Speakers", t0, opener(&mut opens)).unwrap();
         out.release(&a, t0);
-        let (b, stale) = out
+        let b = out
             .acquire("Speakers", t0 + IDLE, opener(&mut opens))
             .unwrap();
 
         assert_eq!(opens, 2);
         assert!(!Arc::ptr_eq(&a, &b));
         // Nothing was playing on it, so it closed before the reopen.
-        assert!(stale.is_none());
         assert_eq!(Arc::strong_count(&a), 1);
     }
 
@@ -342,7 +334,7 @@ mod tests {
         let mut opens = 0;
         let t0 = Instant::now();
 
-        let (a, _) = out.acquire("Speakers", t0, opener(&mut opens)).unwrap();
+        let a = out.acquire("Speakers", t0, opener(&mut opens)).unwrap();
         out.release(&a, t0);
         out.acquire("Headphones", t0, opener(&mut opens)).unwrap();
 
@@ -355,7 +347,7 @@ mod tests {
         let mut flag = None;
         let t0 = Instant::now();
 
-        let (a, _) = out
+        let a = out
             .acquire("Speakers", t0, |failed| {
                 flag = Some(failed);
                 Ok::<_, ()>(1)
@@ -385,8 +377,8 @@ mod tests {
         let t0 = Instant::now();
 
         // Two overlapping sounds; the stream must outlive both.
-        let (a, _) = out.acquire("Speakers", t0, opener(&mut opens)).unwrap();
-        let (b, _) = out.acquire("Speakers", t0, opener(&mut opens)).unwrap();
+        let a = out.acquire("Speakers", t0, opener(&mut opens)).unwrap();
+        let b = out.acquire("Speakers", t0, opener(&mut opens)).unwrap();
         out.release(&a, t0);
         assert_eq!(out.reap(t0 + IDLE * 2).0, Reap::Wait(PLAYING_POLL));
 
@@ -410,10 +402,10 @@ mod tests {
         let t0 = Instant::now();
 
         // A sound still playing on the old device when the device changes.
-        let (old, _) = out.acquire("Speakers", t0, opener(&mut opens)).unwrap();
-        let (new, stale) = out.acquire("Headphones", t0, opener(&mut opens)).unwrap();
-        // The caller still holds `old`, so dropping `stale` doesn't stop it.
-        assert!(stale.is_some_and(|s| Arc::ptr_eq(&s, &old)));
+        let old = out.acquire("Speakers", t0, opener(&mut opens)).unwrap();
+        let new = out.acquire("Headphones", t0, opener(&mut opens)).unwrap();
+        // Only the sound playing on it still holds the old stream.
+        assert_eq!(Arc::strong_count(&old), 1);
         out.release(&old, t0);
 
         // The new stream is still counted as playing, so it isn't reaped.
