@@ -1,6 +1,8 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::apple_intelligence;
-use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, SoundType};
+use crate::audio_feedback::{
+    play_feedback_sound, play_feedback_sound_blocking, prepare_feedback_output, SoundType,
+};
 use crate::audio_toolkit::VadPolicy;
 use crate::managers::audio::{recording_notice_code, AudioRecordingManager};
 use crate::managers::history::HistoryManager;
@@ -517,6 +519,9 @@ impl ShortcutAction for TranscribeAction {
     fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
         let start_time = Instant::now();
         debug!("TranscribeAction::start called for binding: {}", binding_id);
+
+        // The start sound plays once the mic is ready; have its output open by then.
+        prepare_feedback_output(app);
 
         // Load model in the background
         let tm = app.state::<Arc<TranscriptionManager>>();

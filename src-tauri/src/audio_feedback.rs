@@ -1,7 +1,7 @@
 use crate::feedback_output;
 use crate::settings::SoundTheme;
 use crate::settings::{self, AppSettings};
-use log::error;
+use log::{debug, error};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -42,6 +42,23 @@ fn get_sound_base_dir(settings: &AppSettings) -> tauri::path::BaseDirectory {
         SoundTheme::Custom => tauri::path::BaseDirectory::AppData,
         _ => tauri::path::BaseDirectory::Resource,
     }
+}
+
+/// Opens the feedback output ahead of the start sound, off the caller's
+/// thread. The mic takes longer to open than the output, so starting both at
+/// the key press keeps the output open from delaying the readiness cue.
+pub fn prepare_feedback_output(app: &AppHandle) {
+    let settings = settings::get_settings(app);
+    if !settings.audio_feedback {
+        return;
+    }
+    thread::spawn(move || {
+        let opened =
+            feedback_output::with_output(settings.selected_output_device.as_deref(), |_| Ok(()));
+        if let Err(e) = opened {
+            debug!("Failed to prepare feedback output: {e}");
+        }
+    });
 }
 
 pub fn play_feedback_sound(app: &AppHandle, sound_type: SoundType) {
