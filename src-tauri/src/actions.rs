@@ -520,9 +520,6 @@ impl ShortcutAction for TranscribeAction {
         let start_time = Instant::now();
         debug!("TranscribeAction::start called for binding: {}", binding_id);
 
-        // The start sound plays once the mic is ready; have its output open by then.
-        prepare_feedback_output(app);
-
         // Load model in the background
         let tm = app.state::<Arc<TranscriptionManager>>();
         let rm = app.state::<Arc<AudioRecordingManager>>();
@@ -620,6 +617,9 @@ impl ShortcutAction for TranscribeAction {
             overlay_started.elapsed()
         );
         debug!("Microphone mode - always_on: {}", is_always_on);
+
+        // The start sound plays once the mic is ready; have its output open by then.
+        prepare_feedback_output(&settings);
 
         let mut recording_error: Option<anyhow::Error> = None;
         let recording_start_time = Instant::now();

@@ -256,6 +256,17 @@ pub fn with_output<T>(
     play(lease.0.as_ref().expect("held until drop"))
 }
 
+/// Opens the output for the selected device now, so the next sound finds it
+/// open. A device without an ID is skipped: its stream is never reused, so
+/// opening it early would only get in the way of the sound's own open.
+pub fn prepare(selected_device: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let (device, _) = resolve_device(selected_device)?;
+    if device.id().is_err() {
+        return Ok(());
+    }
+    with_output(selected_device, |_| Ok(()))
+}
+
 fn spawn_reaper() {
     let spawned = thread::Builder::new()
         .name("feedback-output-reaper".into())
